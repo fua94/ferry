@@ -23,6 +23,7 @@ type downloadLinks struct {
 
 type downloadLink struct {
 	messageID string
+	channelID string
 	deviceID  string
 	expiresAt time.Time
 }
@@ -57,7 +58,11 @@ func (l *downloadLinks) pruneLocked(now time.Time) {
 }
 
 func (s *server) createDownloadLink(w http.ResponseWriter, r *http.Request) {
-	message, file, err := s.store.OpenFile(r.Context(), r.PathValue("message_id"))
+	channelID, ok := s.authorizedChannel(w, r)
+	if !ok {
+		return
+	}
+	message, file, err := s.store.OpenFile(r.Context(), channelID, r.PathValue("message_id"))
 	if errors.Is(err, ErrNotFound) {
 		writeError(w, http.StatusNotFound, "not_found", "file message was not found")
 		return
@@ -76,7 +81,7 @@ func (s *server) createDownloadLink(w http.ResponseWriter, r *http.Request) {
 	}
 	now := s.now()
 	expiresAt := now.Add(downloadLinkLifetime)
-	s.links.add(hash, downloadLink{messageID: message.ID, deviceID: currentDevice(r).ID, expiresAt: expiresAt}, now)
+	s.links.add(hash, downloadLink{messageID: message.ID, channelID: channelID, deviceID: currentDevice(r).ID, expiresAt: expiresAt}, now)
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusCreated, map[string]string{
 		"url":        "/api/v1/downloads/" + ticket,
@@ -109,7 +114,7 @@ func (s *server) downloadByLink(w http.ResponseWriter, r *http.Request) {
 		s.downloadLinkNotFound(w)
 		return
 	}
-	s.serveFile(w, r, link.messageID)
+	s.serveFile(w, r, link.channelID, link.messageID)
 }
 
 func (s *server) downloadLinkNotFound(w http.ResponseWriter) {

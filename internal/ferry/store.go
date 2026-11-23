@@ -14,6 +14,17 @@ import (
 )
 
 const schema = `
+CREATE TABLE IF NOT EXISTS channels (
+    id TEXT PRIMARY KEY CHECK(length(id) BETWEEN 1 AND 32),
+    name TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS device_channels (
+    device_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(device_id, channel_id)
+);
 CREATE TABLE IF NOT EXISTS messages (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT NOT NULL UNIQUE CHECK(length(id) = 32),
@@ -89,6 +100,14 @@ func OpenStore(ctx context.Context, dataDir string) (*Store, error) {
 }
 
 func (s *Store) initialize(ctx context.Context) error {
+	// A database without a channels table predates channels entirely, so every
+	// device in it belongs to the default channel. Later opens must not repeat
+	// that backfill: a device deliberately kept out of default would be pulled
+	// back in on every restart.
+	var legacy bool
+	if err := s.db.QueryRowContext(ctx, "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'channels')").Scan(&legacy); err != nil {
+		return fmt.Errorf("inspect channel schema: %w", err)
+	}
 	statements := []string{
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA foreign_keys = ON",
@@ -103,7 +122,7 @@ func (s *Store) initialize(ctx context.Context) error {
 	if err := s.migrateSchemaColumns(ctx); err != nil {
 		return err
 	}
-	return nil
+	return s.migrateChannels(ctx, legacy)
 }
 
 func (s *Store) migrateSchemaColumns(ctx context.Context) error {
@@ -118,6 +137,8 @@ func (s *Store) migrateSchemaColumns(ctx context.Context) error {
 		{"devices", "kind", "ALTER TABLE devices ADD COLUMN kind TEXT CHECK(kind IN ('iphone', 'ipad', 'mac', 'android', 'windows', 'browser'))"},
 		{"messages", "sender_kind", "ALTER TABLE messages ADD COLUMN sender_kind TEXT CHECK(sender_kind IN ('iphone', 'ipad', 'mac', 'android', 'windows', 'browser'))"},
 		{"messages", "sender_device_id", "ALTER TABLE messages ADD COLUMN sender_device_id TEXT CHECK(sender_device_id IS NULL OR length(sender_device_id) = 32)"},
+		{"messages", "channel_id", "ALTER TABLE messages ADD COLUMN channel_id TEXT NOT NULL DEFAULT '" + DefaultChannelID + "'"},
+		{"retractions", "channel_id", "ALTER TABLE retractions ADD COLUMN channel_id TEXT NOT NULL DEFAULT '" + DefaultChannelID + "'"},
 	}
 	for _, column := range columns {
 		exists, err := columnExists(ctx, transaction, column.table, column.name)
@@ -130,8 +151,54 @@ func (s *Store) migrateSchemaColumns(ctx context.Context) error {
 			}
 		}
 	}
+	// The indexes need the migrated columns, so they cannot live in schema,
+	// which runs before the ALTER TABLE statements above.
+	indexes := []string{
+		"CREATE INDEX IF NOT EXISTS messages_channel_sequence ON messages(channel_id, sequence)",
+		"CREATE INDEX IF NOT EXISTS retractions_channel_sequence ON retractions(channel_id, sequence)",
+	}
+	for _, statement := range indexes {
+		if _, err := transaction.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("create channel index: %w", err)
+		}
+	}
 	if err := transaction.Commit(); err != nil {
 		return fmt.Errorf("commit schema migration: %w", err)
+	}
+	return nil
+}
+
+// migrateChannels always guarantees the default channel, and gives a legacy
+// database the memberships it would have had if channels had existed then.
+func (s *Store) migrateChannels(ctx context.Context, legacy bool) error {
+	transaction, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin channel migration: %w", err)
+	}
+	defer transaction.Rollback()
+	exists, err := columnExists(ctx, transaction, "channels", "id")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("channel schema is missing")
+	}
+	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := transaction.ExecContext(ctx, `
+        INSERT OR IGNORE INTO channels (id, name, created_at) VALUES (?, ?, ?)
+    `, DefaultChannelID, DefaultChannelID, createdAt); err != nil {
+		return fmt.Errorf("ensure default channel: %w", err)
+	}
+	if legacy {
+		if _, err := transaction.ExecContext(ctx, `
+            INSERT OR IGNORE INTO device_channels (device_id, channel_id, created_at)
+            SELECT id, ?, created_at FROM devices
+        `, DefaultChannelID); err != nil {
+			return fmt.Errorf("backfill default memberships: %w", err)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit channel migration: %w", err)
 	}
 	return nil
 }
@@ -242,21 +309,28 @@ func (s *Store) DeviceCount(ctx context.Context) (int, error) {
 }
 
 func (s *Store) CreateDevice(ctx context.Context, name string, tokenHash [32]byte) (Device, error) {
-	return s.createDevice(ctx, name, "", tokenHash, "")
+	return s.createDevice(ctx, name, "", tokenHash, "", DefaultChannelID)
 }
 
 func (s *Store) CreateDeviceWithKind(ctx context.Context, name string, kind DeviceKind, tokenHash [32]byte) (Device, error) {
-	return s.createDevice(ctx, name, kind, tokenHash, "")
+	return s.createDevice(ctx, name, kind, tokenHash, "", DefaultChannelID)
+}
+
+// CreateDeviceWithKindInChannel joins the new device to one channel only. A
+// missing channel is ErrNotFound and leaves no device behind, so a failed join
+// cannot burn a token or create an orphan.
+func (s *Store) CreateDeviceWithKindInChannel(ctx context.Context, name string, kind DeviceKind, tokenHash [32]byte, channelID string) (Device, error) {
+	return s.createDevice(ctx, name, kind, tokenHash, "", channelID)
 }
 
 func (s *Store) CreateDeviceForIssuer(ctx context.Context, name string, tokenHash [32]byte, issuerID string) (Device, error) {
 	if !validID(issuerID) {
 		return Device{}, ErrNotFound
 	}
-	return s.createDevice(ctx, name, "", tokenHash, issuerID)
+	return s.createDevice(ctx, name, "", tokenHash, issuerID, DefaultChannelID)
 }
 
-func (s *Store) createDevice(ctx context.Context, name string, kind DeviceKind, tokenHash [32]byte, issuerID string) (Device, error) {
+func (s *Store) createDevice(ctx context.Context, name string, kind DeviceKind, tokenHash [32]byte, issuerID, channelID string) (Device, error) {
 	name, err := normalizeSenderName(name)
 	if err != nil {
 		return Device{}, err
@@ -265,11 +339,35 @@ func (s *Store) createDevice(ctx context.Context, name string, kind DeviceKind, 
 	if err != nil {
 		return Device{}, err
 	}
+	channelID, err = normalizeChannelID(channelID)
+	if err != nil {
+		return Device{}, err
+	}
 	id, err := newID()
 	if err != nil {
 		return Device{}, err
 	}
 	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+
+	transaction, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Device{}, fmt.Errorf("begin device insert: %w", err)
+	}
+	defer transaction.Rollback()
+	exists, err := columnExists(ctx, transaction, "channels", "id")
+	if err != nil {
+		return Device{}, err
+	}
+	if !exists {
+		return Device{}, fmt.Errorf("channel schema is missing")
+	}
+	var channelExists bool
+	if err := transaction.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM channels WHERE id = ?)", channelID).Scan(&channelExists); err != nil {
+		return Device{}, fmt.Errorf("check device channel: %w", err)
+	}
+	if !channelExists {
+		return Device{}, ErrNotFound
+	}
 	query := `INSERT INTO devices (id, name, kind, token_hash, created_at) VALUES (?, ?, ?, ?, ?)`
 	arguments := []any{id, name, kind, tokenHash[:], createdAt}
 	if issuerID != "" {
@@ -279,7 +377,7 @@ func (s *Store) createDevice(ctx context.Context, name string, kind DeviceKind, 
         `
 		arguments = append(arguments, issuerID)
 	}
-	result, err := s.db.ExecContext(ctx, query, arguments...)
+	result, err := transaction.ExecContext(ctx, query, arguments...)
 	if err != nil {
 		return Device{}, fmt.Errorf("insert device: %w", err)
 	}
@@ -289,6 +387,14 @@ func (s *Store) createDevice(ctx context.Context, name string, kind DeviceKind, 
 	}
 	if inserted != 1 {
 		return Device{}, ErrNotFound
+	}
+	if _, err := transaction.ExecContext(ctx, `
+        INSERT INTO device_channels (device_id, channel_id, created_at) VALUES (?, ?, ?)
+    `, id, channelID, createdAt); err != nil {
+		return Device{}, fmt.Errorf("insert device channel: %w", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		return Device{}, fmt.Errorf("commit device insert: %w", err)
 	}
 	return Device{ID: id, Name: name, Kind: kind, CreatedAt: createdAt}, nil
 }
@@ -315,10 +421,18 @@ func (s *Store) AuthenticateDevice(ctx context.Context, tokenHash [32]byte) (Dev
 	return device, err
 }
 
-func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
+func (s *Store) ListDevices(ctx context.Context, channelID string) ([]Device, error) {
+	channelID, err := normalizeChannelID(channelID)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `
-        SELECT id, name, kind, created_at FROM devices ORDER BY created_at, id
-    `)
+        SELECT devices.id, devices.name, devices.kind, devices.created_at
+        FROM devices
+        JOIN device_channels ON device_channels.device_id = devices.id
+        WHERE device_channels.channel_id = ?
+        ORDER BY devices.created_at, devices.id
+    `, channelID)
 	if err != nil {
 		return nil, fmt.Errorf("query devices: %w", err)
 	}
@@ -337,39 +451,226 @@ func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
 	return devices, nil
 }
 
-func (s *Store) DeleteDevice(ctx context.Context, requesterID, id string) error {
+// DeleteDevice revokes a device only through a channel both devices share, so
+// a device cannot learn about or touch one that lives elsewhere.
+func (s *Store) DeleteDevice(ctx context.Context, requesterID, channelID, id string) error {
+	channelID, err := normalizeChannelID(channelID)
+	if err != nil {
+		return err
+	}
 	if !validID(requesterID) || !validID(id) {
 		return ErrNotFound
 	}
-	result, err := s.db.ExecContext(ctx, `
-        DELETE FROM devices
-        WHERE id = ? AND id <> ? AND (SELECT COUNT(*) FROM devices) > 1
-          AND EXISTS (SELECT 1 FROM devices WHERE id = ?)
-	`, id, requesterID, requesterID)
+	transaction, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("delete device: %w", err)
+		return fmt.Errorf("begin device delete: %w", err)
 	}
-	deleted, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("read delete result: %w", err)
+	defer transaction.Rollback()
+	var requesterLive, targetLive bool
+	if err := transaction.QueryRowContext(ctx, `
+        SELECT EXISTS(
+                   SELECT 1 FROM devices
+                   JOIN device_channels ON device_channels.device_id = devices.id
+                   WHERE devices.id = ? AND device_channels.channel_id = ?
+               ),
+               EXISTS(
+                   SELECT 1 FROM devices
+                   JOIN device_channels ON device_channels.device_id = devices.id
+                   WHERE devices.id = ? AND device_channels.channel_id = ?
+               )
+    `, requesterID, channelID, id, channelID).Scan(&requesterLive, &targetLive); err != nil {
+		return fmt.Errorf("check device delete: %w", err)
 	}
-	if deleted != 1 {
-		var targetExists, requesterExists int
-		if err := s.db.QueryRowContext(ctx, `
-            SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?),
-                   EXISTS(SELECT 1 FROM devices WHERE id = ?)
-        `, id, requesterID).Scan(&targetExists, &requesterExists); err != nil {
-			return fmt.Errorf("check device after delete: %w", err)
-		}
-		if requesterExists == 0 {
-			return ErrUnauthorized
-		}
-		if targetExists == 0 {
-			return ErrNotFound
-		}
+	if !requesterLive {
+		return ErrUnauthorized
+	}
+	if !targetLive {
+		return ErrNotFound
+	}
+	if id == requesterID {
 		return ErrInvalid
 	}
+	var count int
+	if err := transaction.QueryRowContext(ctx, "SELECT COUNT(*) FROM devices").Scan(&count); err != nil {
+		return fmt.Errorf("count devices before delete: %w", err)
+	}
+	if count <= 1 {
+		return ErrInvalid
+	}
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM devices WHERE id = ?", id); err != nil {
+		return fmt.Errorf("delete device: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM device_channels WHERE device_id = ?", id); err != nil {
+		return fmt.Errorf("delete device channels: %w", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit device delete: %w", err)
+	}
 	return nil
+}
+
+// CreateChannel registers a slug. It is not idempotent: an existing slug is
+// ErrConflict so the HTTP layer can answer 409 instead of a second 201 that
+// hides which device created the channel.
+func (s *Store) CreateChannel(ctx context.Context, id string) (Channel, error) {
+	id, err := normalizeChannelID(id)
+	if err != nil {
+		return Channel{}, err
+	}
+	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx, `
+        INSERT INTO channels (id, name, created_at) VALUES (?, ?, ?)
+        ON CONFLICT DO NOTHING
+    `, id, id, createdAt)
+	if err != nil {
+		return Channel{}, fmt.Errorf("insert channel: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return Channel{}, fmt.Errorf("read channel insert result: %w", err)
+	}
+	if inserted != 1 {
+		return Channel{}, ErrConflict
+	}
+	return Channel{ID: id, Name: id, CreatedAt: createdAt}, nil
+}
+
+func (s *Store) ChannelExists(ctx context.Context, id string) (bool, error) {
+	if !validChannelID(id) {
+		return false, nil
+	}
+	var exists int
+	if err := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM channels WHERE id = ?)", id).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check channel: %w", err)
+	}
+	return exists == 1, nil
+}
+
+// ListChannels returns every channel on this server with a flag saying whether
+// the asking device is a member. Channel names are not secret on a trusted LAN
+// and a Slack-style picker has to show them, but reading a timeline still needs
+// membership, so `joined` decides whether the client opens or joins first.
+func (s *Store) ListChannels(ctx context.Context, deviceID string) ([]Channel, error) {
+	if !validID(deviceID) {
+		return nil, ErrUnauthorized
+	}
+	rows, err := s.db.QueryContext(ctx, `
+        SELECT channels.id, channels.name, channels.created_at,
+               EXISTS(
+                   SELECT 1 FROM device_channels
+                   WHERE device_channels.channel_id = channels.id
+                     AND device_channels.device_id = ?
+               )
+        FROM channels
+        ORDER BY channels.created_at, channels.id
+    `, deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("query channels: %w", err)
+	}
+	defer rows.Close()
+	channels := make([]Channel, 0)
+	for rows.Next() {
+		channel, err := scanChannel(rows)
+		if err != nil {
+			return nil, err
+		}
+		channels = append(channels, channel)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate channels: %w", err)
+	}
+	return channels, nil
+}
+
+func (s *Store) JoinChannel(ctx context.Context, deviceID, channelID string) error {
+	if !validID(deviceID) {
+		return ErrUnauthorized
+	}
+	channelID, err := normalizeChannelID(channelID)
+	if err != nil {
+		return err
+	}
+	exists, err := s.ChannelExists(ctx, channelID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNotFound
+	}
+	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx, `
+        INSERT OR IGNORE INTO device_channels (device_id, channel_id, created_at)
+        SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM devices WHERE id = ?)
+    `, deviceID, channelID, createdAt, deviceID)
+	if err != nil {
+		return fmt.Errorf("join channel: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read channel join result: %w", err)
+	}
+	if inserted != 1 {
+		var live int
+		if err := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)", deviceID).Scan(&live); err != nil {
+			return fmt.Errorf("check channel member: %w", err)
+		}
+		if live == 0 {
+			return ErrUnauthorized
+		}
+	}
+	return nil
+}
+
+func (s *Store) IsChannelMember(ctx context.Context, deviceID, channelID string) (bool, error) {
+	if !validID(deviceID) || !validChannelID(channelID) {
+		return false, nil
+	}
+	var member int
+	if err := s.db.QueryRowContext(ctx, `
+        SELECT EXISTS(SELECT 1 FROM device_channels WHERE device_id = ? AND channel_id = ?)
+    `, deviceID, channelID).Scan(&member); err != nil {
+		return false, fmt.Errorf("check channel membership: %w", err)
+	}
+	return member == 1, nil
+}
+
+// ChannelOfMessage reports which channel owns a message, including one whose
+// content is already gone but whose retraction intent still names the channel.
+func (s *Store) ChannelOfMessage(ctx context.Context, id string) (string, error) {
+	if !validID(id) {
+		return "", ErrNotFound
+	}
+	var channelID string
+	err := s.db.QueryRowContext(ctx, `
+        SELECT channel_id FROM messages WHERE id = ?
+        UNION ALL
+        SELECT channel_id FROM retractions WHERE message_id = ?
+        LIMIT 1
+    `, id, id).Scan(&channelID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("read message channel: %w", err)
+	}
+	if !validChannelID(channelID) {
+		return "", fmt.Errorf("stored message channel is invalid")
+	}
+	return channelID, nil
+}
+
+func scanChannel(row rowScanner) (Channel, error) {
+	var channel Channel
+	if err := row.Scan(&channel.ID, &channel.Name, &channel.CreatedAt, &channel.Joined); err != nil {
+		return Channel{}, err
+	}
+	if !validChannelID(channel.ID) || channel.Name != channel.ID {
+		return Channel{}, fmt.Errorf("stored channel is invalid")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, channel.CreatedAt); err != nil {
+		return Channel{}, fmt.Errorf("stored channel timestamp is not RFC 3339")
+	}
+	return channel, nil
 }
 
 func scanDevice(row rowScanner) (Device, error) {
@@ -397,18 +698,25 @@ func scanDevice(row rowScanner) (Device, error) {
 }
 
 func (s *Store) CreateText(ctx context.Context, senderName, text string) (Message, error) {
-	return s.createText(ctx, "", senderName, inferDeviceKind(senderName), text)
+	return s.createText(ctx, "", DefaultChannelID, senderName, inferDeviceKind(senderName), text)
 }
 
-func (s *Store) CreateTextForDevice(ctx context.Context, device Device, text string) (Message, error) {
+// CreateTextForDevice posts into one channel and fails with ErrUnauthorized
+// when the device is not a member, so membership is enforced at the write and
+// not only by the handler's pre-check.
+func (s *Store) CreateTextForDevice(ctx context.Context, device Device, channelID, text string) (Message, error) {
 	if !validID(device.ID) || !validDeviceKind(device.Kind) {
 		return Message{}, ErrUnauthorized
 	}
-	return s.createText(ctx, device.ID, device.Name, device.Kind, text)
+	return s.createText(ctx, device.ID, channelID, device.Name, device.Kind, text)
 }
 
-func (s *Store) createText(ctx context.Context, requesterID, senderName string, senderKind DeviceKind, text string) (Message, error) {
+func (s *Store) createText(ctx context.Context, requesterID, channelID, senderName string, senderKind DeviceKind, text string) (Message, error) {
 	senderName, err := normalizeSenderName(senderName)
+	if err != nil {
+		return Message{}, err
+	}
+	channelID, err = normalizeChannelID(channelID)
 	if err != nil {
 		return Message{}, err
 	}
@@ -425,27 +733,33 @@ func (s *Store) createText(ctx context.Context, requesterID, senderName string, 
 	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
 	var sequence int64
 	query := `
-		INSERT INTO messages (id, kind, sender_name, sender_kind, sender_device_id, text_body, created_at)
-		VALUES (?, 'text', ?, ?, NULL, ?, ?)
+		INSERT INTO messages (id, kind, sender_name, sender_kind, sender_device_id, text_body, created_at, channel_id)
+		SELECT ?, 'text', ?, ?, NULL, ?, ?, ?
+        WHERE EXISTS (SELECT 1 FROM channels WHERE id = ?)
 		RETURNING sequence
 	`
-	arguments := []any{id, senderName, senderKind, text, createdAt}
+	arguments := []any{id, senderName, senderKind, text, createdAt, channelID, channelID}
 	if requesterID != "" {
 		query = `
-			INSERT INTO messages (id, kind, sender_name, sender_kind, sender_device_id, text_body, created_at)
-			SELECT ?, 'text', ?, ?, ?, ?, ?
-            WHERE EXISTS (
+			INSERT INTO messages (id, kind, sender_name, sender_kind, sender_device_id, text_body, created_at, channel_id)
+			SELECT ?, 'text', ?, ?, ?, ?, ?, ?
+            WHERE EXISTS (SELECT 1 FROM channels WHERE id = ?)
+              AND EXISTS (SELECT 1 FROM device_channels WHERE device_id = ? AND channel_id = ?)
+              AND EXISTS (
                 SELECT 1 FROM devices
                 WHERE id = ? AND name = ?
                   AND (kind = ? OR (kind IS NULL AND ? = ?))
             )
             RETURNING sequence
         `
-		arguments = []any{id, senderName, senderKind, requesterID, text, createdAt, requesterID, senderName, senderKind, senderKind, inferDeviceKind(senderName)}
+		arguments = []any{id, senderName, senderKind, requesterID, text, createdAt, channelID, channelID, requesterID, channelID, requesterID, senderName, senderKind, senderKind, inferDeviceKind(senderName)}
 	}
 	err = s.db.QueryRowContext(ctx, query, arguments...).Scan(&sequence)
 	if errors.Is(err, sql.ErrNoRows) && requesterID != "" {
 		return Message{}, ErrUnauthorized
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return Message{}, ErrNotFound
 	}
 	if err != nil {
 		return Message{}, fmt.Errorf("insert text message: %w", err)
@@ -463,18 +777,22 @@ func (s *Store) createText(ctx context.Context, requesterID, senderName string, 
 }
 
 func (s *Store) CreateFile(ctx context.Context, senderName, fileName, mediaType string, source io.Reader) (Message, error) {
-	return s.createFile(ctx, "", senderName, inferDeviceKind(senderName), fileName, mediaType, source)
+	return s.createFile(ctx, "", DefaultChannelID, senderName, inferDeviceKind(senderName), fileName, mediaType, source)
 }
 
-func (s *Store) CreateFileForDevice(ctx context.Context, device Device, fileName, mediaType string, source io.Reader) (Message, error) {
+func (s *Store) CreateFileForDevice(ctx context.Context, device Device, channelID, fileName, mediaType string, source io.Reader) (Message, error) {
 	if !validID(device.ID) || !validDeviceKind(device.Kind) {
 		return Message{}, ErrUnauthorized
 	}
-	return s.createFile(ctx, device.ID, device.Name, device.Kind, fileName, mediaType, source)
+	return s.createFile(ctx, device.ID, channelID, device.Name, device.Kind, fileName, mediaType, source)
 }
 
-func (s *Store) createFile(ctx context.Context, requesterID, senderName string, senderKind DeviceKind, fileName, mediaType string, source io.Reader) (Message, error) {
+func (s *Store) createFile(ctx context.Context, requesterID, channelID, senderName string, senderKind DeviceKind, fileName, mediaType string, source io.Reader) (Message, error) {
 	senderName, err := normalizeSenderName(senderName)
+	if err != nil {
+		return Message{}, err
+	}
+	channelID, err = normalizeChannelID(channelID)
 	if err != nil {
 		return Message{}, err
 	}
@@ -524,27 +842,33 @@ func (s *Store) createFile(ctx context.Context, requesterID, senderName string, 
 	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
 	var sequence int64
 	query := `
-		INSERT INTO messages (id, kind, sender_name, sender_kind, sender_device_id, file_name, media_type, file_size, blob_name, created_at)
-		VALUES (?, 'file', ?, ?, NULL, ?, ?, ?, ?, ?)
+		INSERT INTO messages (id, kind, sender_name, sender_kind, sender_device_id, file_name, media_type, file_size, blob_name, created_at, channel_id)
+		SELECT ?, 'file', ?, ?, NULL, ?, ?, ?, ?, ?, ?
+        WHERE EXISTS (SELECT 1 FROM channels WHERE id = ?)
 		RETURNING sequence
 	`
-	arguments := []any{id, senderName, senderKind, fileName, mediaType, written, blobName, createdAt}
+	arguments := []any{id, senderName, senderKind, fileName, mediaType, written, blobName, createdAt, channelID, channelID}
 	if requesterID != "" {
 		query = `
-			INSERT INTO messages (id, kind, sender_name, sender_kind, sender_device_id, file_name, media_type, file_size, blob_name, created_at)
-			SELECT ?, 'file', ?, ?, ?, ?, ?, ?, ?, ?
-            WHERE EXISTS (
+			INSERT INTO messages (id, kind, sender_name, sender_kind, sender_device_id, file_name, media_type, file_size, blob_name, created_at, channel_id)
+			SELECT ?, 'file', ?, ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE EXISTS (SELECT 1 FROM channels WHERE id = ?)
+              AND EXISTS (SELECT 1 FROM device_channels WHERE device_id = ? AND channel_id = ?)
+              AND EXISTS (
                 SELECT 1 FROM devices
                 WHERE id = ? AND name = ?
                   AND (kind = ? OR (kind IS NULL AND ? = ?))
             )
             RETURNING sequence
         `
-		arguments = []any{id, senderName, senderKind, requesterID, fileName, mediaType, written, blobName, createdAt, requesterID, senderName, senderKind, senderKind, inferDeviceKind(senderName)}
+		arguments = []any{id, senderName, senderKind, requesterID, fileName, mediaType, written, blobName, createdAt, channelID, channelID, requesterID, channelID, requesterID, senderName, senderKind, senderKind, inferDeviceKind(senderName)}
 	}
 	err = s.db.QueryRowContext(ctx, query, arguments...).Scan(&sequence)
 	if errors.Is(err, sql.ErrNoRows) && requesterID != "" {
 		return Message{}, ErrUnauthorized
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return Message{}, ErrNotFound
 	}
 	if err != nil {
 		return Message{}, fmt.Errorf("insert file message: %w", err)
@@ -567,14 +891,18 @@ func (s *Store) createFile(ctx context.Context, requesterID, senderName string, 
 	}, nil
 }
 
-func (s *Store) ListMessages(ctx context.Context, after int64, limit int) ([]Message, int64, error) {
+func (s *Store) ListMessages(ctx context.Context, channelID string, after int64, limit int) ([]Message, int64, error) {
+	channelID, err := normalizeChannelID(channelID)
+	if err != nil {
+		return nil, after, err
+	}
 	rows, err := s.db.QueryContext(ctx, `
         SELECT sequence, id, kind, sender_name, sender_kind, sender_device_id, text_body, file_name, media_type, file_size, blob_name, created_at
         FROM messages
-        WHERE sequence > ?
+        WHERE channel_id = ? AND sequence > ?
         ORDER BY sequence ASC
         LIMIT ?
-    `, after, limit)
+    `, channelID, after, limit)
 	if err != nil {
 		return nil, after, fmt.Errorf("query messages: %w", err)
 	}
@@ -598,8 +926,12 @@ func (s *Store) ListMessages(ctx context.Context, after int64, limit int) ([]Mes
 
 // Retractions have their own cursor so removing an old message cannot be
 // missed by a client that has already read past its message sequence.
-func (s *Store) ListRetractions(ctx context.Context, after int64, limit int) ([]string, int64, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT sequence, message_id FROM retractions WHERE sequence > ? ORDER BY sequence LIMIT ?`, after, limit)
+func (s *Store) ListRetractions(ctx context.Context, channelID string, after int64, limit int) ([]string, int64, error) {
+	channelID, err := normalizeChannelID(channelID)
+	if err != nil {
+		return nil, after, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT sequence, message_id FROM retractions WHERE channel_id = ? AND sequence > ? ORDER BY sequence LIMIT ?`, channelID, after, limit)
 	if err != nil {
 		return nil, after, err
 	}
@@ -616,32 +948,44 @@ func (s *Store) ListRetractions(ctx context.Context, after int64, limit int) ([]
 	return ids, next, rows.Err()
 }
 
-func (s *Store) RetractMessage(ctx context.Context, requesterID, id string) error {
+func (s *Store) RetractMessage(ctx context.Context, requesterID, channelID, id string) error {
+	channelID, err := normalizeChannelID(channelID)
+	if err != nil {
+		return err
+	}
 	if !validID(id) {
 		return ErrNotFound
+	}
+	if !validID(requesterID) {
+		return ErrUnauthorized
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var live bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)`, requesterID).Scan(&live); err != nil {
+	var member bool
+	if err := tx.QueryRowContext(ctx, `
+        SELECT EXISTS(SELECT 1 FROM device_channels WHERE device_id = ? AND channel_id = ?)
+    `, requesterID, channelID).Scan(&member); err != nil {
 		return err
 	}
-	if !live {
+	if !member {
 		return ErrUnauthorized
 	}
 	// Persist intent before unlink, including for legacy messages. Any live
-	// device in the trusted space can finish or retry the same operation.
+	// device in the channel can finish or retry the same operation.
 	var exists bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM messages WHERE id = ? UNION ALL SELECT 1 FROM retractions WHERE message_id = ?)`, id, id).Scan(&exists); err != nil {
+	if err := tx.QueryRowContext(ctx, `
+        SELECT EXISTS(SELECT 1 FROM messages WHERE id = ? AND channel_id = ?)
+            OR EXISTS(SELECT 1 FROM retractions WHERE message_id = ? AND channel_id = ?)
+    `, id, channelID, id, channelID).Scan(&exists); err != nil {
 		return err
 	}
 	if !exists {
 		return ErrNotFound
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO retractions (message_id) VALUES (?) ON CONFLICT(message_id) DO NOTHING`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO retractions (message_id, channel_id) VALUES (?, ?) ON CONFLICT(message_id) DO NOTHING`, id, channelID); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -709,15 +1053,19 @@ func (s *Store) cleanupRetractions(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) OpenFile(ctx context.Context, id string) (Message, *os.File, error) {
+func (s *Store) OpenFile(ctx context.Context, channelID, id string) (Message, *os.File, error) {
+	channelID, err := normalizeChannelID(channelID)
+	if err != nil {
+		return Message{}, nil, ErrNotFound
+	}
 	if !validID(id) {
 		return Message{}, nil, ErrNotFound
 	}
 	row := s.db.QueryRowContext(ctx, `
         SELECT sequence, id, kind, sender_name, sender_kind, sender_device_id, text_body, file_name, media_type, file_size, blob_name, created_at
         FROM messages
-        WHERE id = ?
-    `, id)
+        WHERE id = ? AND channel_id = ?
+    `, id, channelID)
 	message, blobName, err := scanMessage(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, nil, ErrNotFound

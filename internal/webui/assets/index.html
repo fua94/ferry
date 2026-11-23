@@ -13,7 +13,7 @@
   </head>
   <body>
     <aside class="sidebar" id="sidebar" aria-label="Ferry navigation" hidden>
-      <div>
+      <div class="sidebar-top">
         <div class="sidebar-brand" aria-label="Ferry">
         <img class="brand-mark" src="/ferry-icon-64.png" alt="">
           <strong>Ferry</strong>
@@ -28,6 +28,14 @@
             <span>Devices</span>
           </button>
         </nav>
+        <div class="sidebar-channels">
+          <p class="sidebar-heading" id="channels-heading">Channels</p>
+          <div class="channel-list" id="channel-list" role="list" aria-labelledby="channels-heading"></div>
+          <button class="sidebar-item channel-create" id="new-channel" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>
+            <span>New channel</span>
+          </button>
+        </div>
       </div>
       <div class="sidebar-server">
         <img src="/ferry-icon-64.png" alt="">
@@ -49,6 +57,9 @@
     </section>
 
     <main class="conversation" id="conversation" aria-live="polite" hidden>
+      <header class="channel-bar">
+        <h1 class="channel-title" id="channel-title">#default</h1>
+      </header>
       <section class="welcome" id="welcome">
         <div class="welcome-brand"><img class="welcome-mark" src="/ferry-icon-256.png" alt=""><h1>Ferry</h1></div>
         <div class="welcome-guide" id="welcome-guide" hidden>

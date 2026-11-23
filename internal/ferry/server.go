@@ -61,6 +61,9 @@ func newHandler(store *Store, options HandlerOptions, now func() time.Time) http
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/v1/session", s.session)
 	api.HandleFunc("GET /api/v1/messages", s.listMessages)
+	api.HandleFunc("GET /api/v1/channels", s.listChannels)
+	api.HandleFunc("POST /api/v1/channels", s.createChannel)
+	api.HandleFunc("POST /api/v1/channels/join", s.joinChannel)
 	api.HandleFunc("DELETE /api/v1/messages/{message_id}", s.retractMessage)
 	api.HandleFunc("POST /api/v1/messages/text", s.createText)
 	api.HandleFunc("POST /api/v1/messages/file", s.createFile)
@@ -261,6 +264,37 @@ func currentDevice(r *http.Request) Device {
 	return r.Context().Value(deviceContextKey{}).(Device)
 }
 
+// channelFromQuery reads the optional `channel` query parameter. Absent or
+// empty keeps the pre-channel contract: everything happens in "default".
+func channelFromQuery(r *http.Request) (string, error) {
+	value := r.URL.Query().Get("channel")
+	if value == "" {
+		return DefaultChannelID, nil
+	}
+	return normalizeChannelID(value)
+}
+
+// authorizedChannel resolves the request's channel and proves the current
+// device belongs to it. A malformed slug is a 400; an unknown channel and one
+// the device is not in are the same 404, so neither reveals the other.
+func (s *server) authorizedChannel(w http.ResponseWriter, r *http.Request) (string, bool) {
+	channelID, err := channelFromQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return "", false
+	}
+	member, err := s.store.IsChannelMember(r.Context(), currentDevice(r).ID, channelID)
+	if err != nil {
+		s.internalError(w, err)
+		return "", false
+	}
+	if !member {
+		writeError(w, http.StatusNotFound, "not_found", "channel was not found")
+		return "", false
+	}
+	return channelID, true
+}
+
 func (s *server) unauthorized(w http.ResponseWriter) {
 	w.Header().Set("WWW-Authenticate", "Bearer")
 	writeError(w, http.StatusUnauthorized, "unauthorized", "connect this device to Ferry")
@@ -273,6 +307,8 @@ func (s *server) session(w http.ResponseWriter, r *http.Request) {
 type accessJoinRequest struct {
 	DeviceName strictString
 	Password   strictString
+	// Channel is optional; an absent or empty value means the default channel.
+	Channel strictString
 }
 
 func (s *server) accessStatus(w http.ResponseWriter, r *http.Request) {
@@ -316,6 +352,14 @@ func (s *server) join(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("password must be valid UTF-8 and at most %d bytes", maxAccessPasswordBytes))
 		return
 	}
+	channelID := DefaultChannelID
+	if string(request.Channel) != "" {
+		channelID, err = normalizeChannelID(string(request.Channel))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+	}
 	s.accessMu.Lock()
 	defer s.accessMu.Unlock()
 	verifier, err := s.store.AccessPassword(r.Context())
@@ -332,7 +376,11 @@ func (s *server) join(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, err)
 		return
 	}
-	device, err := s.store.CreateDeviceWithKind(r.Context(), name, deviceKind, tokenHash)
+	device, err := s.store.CreateDeviceWithKindInChannel(r.Context(), name, deviceKind, tokenHash, channelID)
+	if errors.Is(err, ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "channel was not found")
+		return
+	}
 	if err != nil {
 		s.domainError(w, err)
 		return
@@ -402,7 +450,11 @@ func (s *server) updateAccessSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listDevices(w http.ResponseWriter, r *http.Request) {
-	devices, err := s.store.ListDevices(r.Context())
+	channelID, ok := s.authorizedChannel(w, r)
+	if !ok {
+		return
+	}
+	devices, err := s.store.ListDevices(r.Context(), channelID)
 	if err != nil {
 		s.internalError(w, err)
 		return
@@ -412,7 +464,11 @@ func (s *server) listDevices(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) deleteDevice(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("device_id")
-	err := s.store.DeleteDevice(r.Context(), currentDevice(r).ID, id)
+	channelID, ok := s.authorizedChannel(w, r)
+	if !ok {
+		return
+	}
+	err := s.store.DeleteDevice(r.Context(), currentDevice(r).ID, channelID, id)
 	if errors.Is(err, ErrUnauthorized) {
 		s.unauthorized(w)
 		return
@@ -433,6 +489,10 @@ func (s *server) deleteDevice(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listMessages(w http.ResponseWriter, r *http.Request) {
+	channelID, ok := s.authorizedChannel(w, r)
+	if !ok {
+		return
+	}
 	after, err := parseNonNegativeInt64(r.URL.Query().Get("after"), 0)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "after must be a non-negative integer")
@@ -448,12 +508,12 @@ func (s *server) listMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "after_retraction must be a non-negative integer")
 		return
 	}
-	messages, nextCursor, err := s.store.ListMessages(r.Context(), after, limit)
+	messages, nextCursor, err := s.store.ListMessages(r.Context(), channelID, after, limit)
 	if err != nil {
 		s.internalError(w, err)
 		return
 	}
-	retractedIDs, nextRetractionCursor, err := s.store.ListRetractions(r.Context(), afterRetraction, limit)
+	retractedIDs, nextRetractionCursor, err := s.store.ListRetractions(r.Context(), channelID, afterRetraction, limit)
 	if err != nil {
 		s.internalError(w, err)
 		return
@@ -473,7 +533,27 @@ func (s *server) listMessages(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) retractMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("message_id")
-	err := s.store.RetractMessage(r.Context(), currentDevice(r).ID, id)
+	channelID, err := s.store.ChannelOfMessage(r.Context(), id)
+	if errors.Is(err, ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "message was not found")
+		return
+	}
+	if err != nil {
+		s.internalError(w, err)
+		return
+	}
+	// A device outside the channel gets the same answer as one asking about a
+	// message that never existed.
+	member, err := s.store.IsChannelMember(r.Context(), currentDevice(r).ID, channelID)
+	if err != nil {
+		s.internalError(w, err)
+		return
+	}
+	if !member {
+		writeError(w, http.StatusNotFound, "not_found", "message was not found")
+		return
+	}
+	err = s.store.RetractMessage(r.Context(), currentDevice(r).ID, channelID, id)
 	if errors.Is(err, ErrUnauthorized) {
 		s.unauthorized(w)
 		return
@@ -490,9 +570,124 @@ func (s *server) retractMessage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"retracted_id": id})
 }
 
+func (s *server) listChannels(w http.ResponseWriter, r *http.Request) {
+	channels, err := s.store.ListChannels(r.Context(), currentDevice(r).ID)
+	if errors.Is(err, ErrUnauthorized) {
+		s.unauthorized(w)
+		return
+	}
+	if err != nil {
+		s.internalError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string][]Channel{"channels": channels})
+}
+
+type createChannelRequest struct {
+	Name strictString
+}
+
+func (s *server) createChannel(w http.ResponseWriter, r *http.Request) {
+	if !hasMediaType(r.Header.Get("Content-Type"), "application/json") {
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
+	request, err := decodeCreateChannelRequest(r.Body)
+	if err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body is too large")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_request", "request body must contain only name")
+		return
+	}
+	channelID, err := normalizeChannelID(string(request.Name))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	channel, err := s.store.CreateChannel(r.Context(), channelID)
+	if errors.Is(err, ErrConflict) {
+		writeError(w, http.StatusConflict, "channel_exists", "channel already exists")
+		return
+	}
+	if err != nil {
+		s.domainError(w, err)
+		return
+	}
+	if err := s.store.JoinChannel(r.Context(), currentDevice(r).ID, channel.ID); err != nil {
+		s.internalError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	channel.Joined = true
+	writeJSON(w, http.StatusCreated, channel)
+}
+
+type joinChannelRequest struct {
+	Channel strictString
+}
+
+func decodeJoinChannelRequest(source io.Reader) (joinChannelRequest, error) {
+	var request joinChannelRequest
+	err := decodeStrictObject(source, map[string]func(*json.Decoder) error{
+		"channel": func(decoder *json.Decoder) error { return decoder.Decode(&request.Channel) },
+	})
+	return request, err
+}
+
+// joinChannel adds the current device to a channel that already exists, so a
+// device that already holds a token can read a second timeline without
+// registering again (and without a second token). An unknown channel is the
+// same 404 a non-member gets elsewhere, so it never confirms what exists.
+func (s *server) joinChannel(w http.ResponseWriter, r *http.Request) {
+	if !hasMediaType(r.Header.Get("Content-Type"), "application/json") {
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
+	request, err := decodeJoinChannelRequest(r.Body)
+	if err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body is too large")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_request", "request body must contain only channel")
+		return
+	}
+	channelID, err := normalizeChannelID(string(request.Channel))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	err = s.store.JoinChannel(r.Context(), currentDevice(r).ID, channelID)
+	if errors.Is(err, ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "channel was not found")
+		return
+	}
+	if errors.Is(err, ErrUnauthorized) {
+		s.unauthorized(w)
+		return
+	}
+	if err != nil {
+		s.domainError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *server) createText(w http.ResponseWriter, r *http.Request) {
 	if !hasMediaType(r.Header.Get("Content-Type"), "application/json") {
 		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
+		return
+	}
+	channelID, ok := s.authorizedChannel(w, r)
+	if !ok {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
@@ -506,7 +701,7 @@ func (s *server) createText(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "request body must contain only text")
 		return
 	}
-	message, err := s.store.CreateTextForDevice(r.Context(), currentDevice(r), string(request.Text))
+	message, err := s.store.CreateTextForDevice(r.Context(), currentDevice(r), channelID, string(request.Text))
 	if errors.Is(err, ErrUnauthorized) {
 		s.unauthorized(w)
 		return
@@ -520,6 +715,10 @@ func (s *server) createText(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) createFile(w http.ResponseWriter, r *http.Request) {
+	channelID, ok := s.authorizedChannel(w, r)
+	if !ok {
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, MaxFileBytes+multipartOverhead)
 	if err := r.ParseMultipartForm(1 << 20); err != nil {
 		var maxBytesError *http.MaxBytesError
@@ -542,7 +741,7 @@ func (s *server) createFile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer source.Close()
 	mediaType := header.Header.Get("Content-Type")
-	message, err := s.store.CreateFileForDevice(r.Context(), currentDevice(r), header.Filename, mediaType, source)
+	message, err := s.store.CreateFileForDevice(r.Context(), currentDevice(r), channelID, header.Filename, mediaType, source)
 	if errors.Is(err, ErrUnauthorized) {
 		s.unauthorized(w)
 		return
@@ -564,11 +763,15 @@ func validMultipartShape(r *http.Request) bool {
 }
 
 func (s *server) downloadFile(w http.ResponseWriter, r *http.Request) {
-	s.serveFile(w, r, r.PathValue("message_id"))
+	channelID, ok := s.authorizedChannel(w, r)
+	if !ok {
+		return
+	}
+	s.serveFile(w, r, channelID, r.PathValue("message_id"))
 }
 
-func (s *server) serveFile(w http.ResponseWriter, r *http.Request, messageID string) {
-	message, file, err := s.store.OpenFile(r.Context(), messageID)
+func (s *server) serveFile(w http.ResponseWriter, r *http.Request, channelID, messageID string) {
+	message, file, err := s.store.OpenFile(r.Context(), channelID, messageID)
 	if errors.Is(err, ErrNotFound) {
 		writeError(w, http.StatusNotFound, "not_found", "file message was not found")
 		return
@@ -646,9 +849,18 @@ func decodeTextRequest(source io.Reader) (textRequest, error) {
 
 func decodeAccessJoinRequest(source io.Reader) (accessJoinRequest, error) {
 	var request accessJoinRequest
-	err := decodeStrictObject(source, map[string]func(*json.Decoder) error{
+	err := decodeStrictFields(source, map[string]func(*json.Decoder) error{
 		"device_name": func(decoder *json.Decoder) error { return decoder.Decode(&request.DeviceName) },
 		"password":    func(decoder *json.Decoder) error { return decoder.Decode(&request.Password) },
+		"channel":     func(decoder *json.Decoder) error { return decoder.Decode(&request.Channel) },
+	}, []string{"device_name", "password"})
+	return request, err
+}
+
+func decodeCreateChannelRequest(source io.Reader) (createChannelRequest, error) {
+	var request createChannelRequest
+	err := decodeStrictObject(source, map[string]func(*json.Decoder) error{
+		"name": func(decoder *json.Decoder) error { return decoder.Decode(&request.Name) },
 	})
 	return request, err
 }
@@ -662,6 +874,17 @@ func decodeAccessSettingsRequest(source io.Reader) (accessSettingsRequest, error
 }
 
 func decodeStrictObject(source io.Reader, fields map[string]func(*json.Decoder) error) error {
+	required := make([]string, 0, len(fields))
+	for key := range fields {
+		required = append(required, key)
+	}
+	return decodeStrictFields(source, fields, required)
+}
+
+// decodeStrictFields is decodeStrictObject with a required subset, so a key
+// like join's optional "channel" can be accepted without weakening the
+// duplicate, unknown-field and exact-shape checks for the rest.
+func decodeStrictFields(source io.Reader, fields map[string]func(*json.Decoder) error, required []string) error {
 	decoder := json.NewDecoder(source)
 	opening, err := decoder.Token()
 	if err != nil || opening != json.Delim('{') {
@@ -687,8 +910,13 @@ func decodeStrictObject(source io.Reader, fields map[string]func(*json.Decoder) 
 		}
 	}
 	closing, err := decoder.Token()
-	if err != nil || closing != json.Delim('}') || len(seen) != len(fields) {
-		return fmt.Errorf("request does not contain the exact required fields")
+	if err != nil || closing != json.Delim('}') {
+		return fmt.Errorf("request is not a complete JSON object")
+	}
+	for _, key := range required {
+		if !seen[key] {
+			return fmt.Errorf("request does not contain the exact required fields")
+		}
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {

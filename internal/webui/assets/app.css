@@ -44,7 +44,16 @@ button:focus-visible, input:focus-visible { outline: 2px solid #777; outline-off
 .sidebar-item { width: 100%; min-height: 40px; display: flex; align-items: center; gap: 11px; padding: 0 11px; color: inherit; background: transparent; border: 0; border-radius: 10px; font-size: 14px; font-weight: 550; text-align: left; }
 .sidebar-item.is-active, .sidebar-item:hover { background: var(--soft); }
 .sidebar-item svg { width: 19px; height: 19px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.sidebar-server { display: flex; align-items: center; gap: 10px; padding: 9px 8px; }
+.sidebar-channels { min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; margin-top: 20px; }
+.sidebar-heading { margin: 0 0 6px; padding: 0 11px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.channel-list { min-height: 0; flex: 1 1 auto; display: grid; align-content: start; gap: 1px; overflow-y: auto; }
+.channel-item { color: var(--muted); }
+.channel-item.is-active { color: inherit; }
+.channel-item.is-unjoined { opacity: .62; }
+.channel-hash { width: 19px; flex: 0 0 auto; color: var(--muted); text-align: center; }
+.channel-item > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.channel-create { margin-top: 4px; color: var(--muted); }
+.sidebar-top { min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; }
 .sidebar-server img { width: 30px; height: 30px; border-radius: 50%; }
 .sidebar-server div, .sidebar-server strong, .sidebar-server span { min-width: 0; display: block; }
 .sidebar-server strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
@@ -285,4 +294,11 @@ textarea:disabled { color: var(--faint); }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
+}
+
+/* Channel picker: one row above the timeline, same width as the messages. */
+.channel-bar { width: min(704px, 100%); margin: 0 auto 18px; display: flex; align-items: center; gap: 8px; }
+.channel-title { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: -.02em; }
+@media (max-width: 760px) {
+  .channel-bar { padding: 0 2px; }
 }

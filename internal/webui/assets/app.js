@@ -41,6 +41,9 @@ const copyAddressButton = document.querySelector("#copy-address");
 const connectStatus = document.querySelector("#connect-status");
 const connectHint = document.querySelector("#connect-hint");
 const connectQR = document.querySelector("#connect-qr");
+const channelList = document.querySelector("#channel-list");
+const channelTitle = document.querySelector("#channel-title");
+const newChannelButton = document.querySelector("#new-channel");
 
 const messageImages = new Map();
 const pendingImages = new WeakMap();
@@ -59,9 +62,11 @@ let cursor = 0;
 let retractionCursor = 0;
 const retracted = new Set();
 let loading = false;
+let loadingChannel = "";
 let sessionLoading = false;
 let currentDevice = null;
 let deviceToken = readStoredToken();
+let activeChannel = readStoredChannel();
 let authGeneration = 0;
 let authController = new AbortController();
 let activityStatus = "";
@@ -153,6 +158,40 @@ function storeToken(token) {
   } catch {
     return false;
   }
+}
+
+// Channels are per device: the server only lists the ones this device joined,
+// so a stale stored id falls back to default (or to the first available one
+// when the device never joined default).
+function readStoredChannel() {
+  try {
+    return localStorage.getItem("ferry_channel") || "default";
+  } catch {
+    return "default";
+  }
+}
+
+function storeChannel(channel) {
+  try {
+    localStorage.setItem("ferry_channel", channel);
+  } catch {
+    // The preference is a convenience; the timeline still works without it.
+  }
+}
+
+function channelQuery() {
+  return `channel=${encodeURIComponent(activeChannel)}`;
+}
+
+// A connect link (the QR code) carries the channel to join. Only a valid slug
+// is honoured, so a stray query parameter cannot send a device somewhere odd.
+function channelFromURL() {
+  const value = new URL(location.href).searchParams.get("channel") || "";
+  return /^[a-z0-9][a-z0-9-]{0,31}$/.test(value) ? value : "";
+}
+
+function channelURL(path) {
+  return `${path}${path.includes("?") ? "&" : "?"}${channelQuery()}`;
 }
 
 function resetTimeline() {
@@ -467,7 +506,7 @@ async function loadMessageImage(figure) {
     request.abort();
   }, IMAGE_LOAD_TIMEOUT_MS);
   try {
-    const response = await authenticatedFetch(message.file.download_url, { cache: "no-store", signal: request.signal });
+    const response = await authenticatedFetch(channelURL(message.file.download_url), { cache: "no-store", signal: request.signal });
     if (generation !== authGeneration) return retryMessageImage(figure);
     if (!response.ok) throw new Error(await readError(response));
     const blob = await response.blob();
@@ -614,7 +653,7 @@ async function downloadMessageFile(message) {
   sendError = "";
   renderStatus();
   try {
-    const response = await authenticatedFetch(`${message.file.download_url}/link`, { method: "POST", cache: "no-store", signal: authController.signal });
+    const response = await authenticatedFetch(channelURL(`${message.file.download_url}/link`), { method: "POST", cache: "no-store", signal: authController.signal });
     if (generation !== authGeneration) return;
     if (response.status === 401) {
       showAccess("This device is no longer connected.");
@@ -640,14 +679,153 @@ async function downloadMessageFile(message) {
   }
 }
 
+async function loadChannels() {
+  const generation = authGeneration;
+  const response = await authenticatedFetch("/api/v1/channels", { cache: "no-store", signal: authController.signal });
+  if (generation !== authGeneration) return;
+  if (response.status === 401) {
+    showAccess("This device is no longer connected.");
+    return;
+  }
+  if (!response.ok) throw new Error(await readError(response));
+  const payload = await response.json();
+  if (generation !== authGeneration) return;
+  renderChannelList(payload.channels || []);
+}
+
+let knownChannels = [];
+
+// Slack-style picker: every channel on the server is listed. Joined channels
+// open on click, the rest join first, which is why the list carries `joined`.
+function renderChannelList(channels) {
+  knownChannels = channels;
+  const joined = channels.filter((channel) => channel.joined).map((channel) => channel.id);
+  if (!joined.includes(activeChannel)) {
+    activeChannel = joined.includes("default") ? "default" : (joined[0] || "default");
+    storeChannel(activeChannel);
+  }
+  channelList.replaceChildren();
+  for (const channel of channels) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "sidebar-item channel-item";
+    button.classList.toggle("is-active", channel.id === activeChannel);
+    button.classList.toggle("is-unjoined", !channel.joined);
+    button.title = channel.joined ? `Open #${channel.name}` : `Join #${channel.name}`;
+    button.setAttribute("aria-current", channel.id === activeChannel ? "page" : "false");
+    button.dataset.channel = channel.id;
+    const hash = document.createElement("span");
+    hash.className = "channel-hash";
+    hash.textContent = "#";
+    const label = document.createElement("span");
+    label.textContent = channel.name;
+    button.append(hash, label);
+    button.addEventListener("click", () => openChannel(channel.id));
+    channelList.append(button);
+  }
+  channelTitle.textContent = `#${activeChannel}`;
+  // The connect address and QR embed the active channel, so they follow a switch.
+  renderConnectSection();
+}
+
+// Keeps the sidebar highlight in step with the timeline after a switch, without
+// refetching the list.
+function markActiveChannel() {
+  channelTitle.textContent = `#${activeChannel}`;
+  for (const button of channelList.querySelectorAll(".channel-item")) {
+    const isActive = button.dataset.channel === activeChannel;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-current", isActive ? "page" : "false");
+  }
+}
+
+// A channel that this device has not joined yet is joined on first click, so
+// the picker behaves like Slack's channel list instead of asking for a token.
+async function openChannel(channelID) {
+  if (channelID === activeChannel) return;
+  const channel = knownChannels.find((entry) => entry.id === channelID);
+  if (channel && !channel.joined) {
+    const generation = authGeneration;
+    const response = await authenticatedFetch("/api/v1/channels/join", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channel: channelID }),
+      signal: authController.signal,
+    });
+    if (generation !== authGeneration) return;
+    if (!response.ok) {
+      sendError = `Could not join #${channelID}`;
+      renderStatus();
+      return;
+    }
+    await loadChannels();
+  }
+  await switchChannel(channelID);
+}
+
+// Switching is a full timeline reset: sequences, retraction cursors, rendered
+// ids and image object URLs all belong to the channel that produced them.
+async function switchChannel(channelID) {
+  if (!channelID || channelID === activeChannel) return;
+  activeChannel = channelID;
+  storeChannel(channelID);
+  markActiveChannel();
+  renderConnectSection();
+  resetTimeline();
+  try {
+    await loadMessages();
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    sendError = error.message;
+    renderStatus();
+  }
+}
+
+async function createChannel() {
+  const answer = window.prompt("New channel name (lowercase letters, numbers, and hyphens):", "");
+  if (answer === null) return;
+  const channelID = answer.trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(channelID)) {
+    window.alert("Channel names use lowercase letters, numbers, and hyphens, up to 32 characters.");
+    return;
+  }
+  const generation = authGeneration;
+  try {
+    const response = await authenticatedFetch("/api/v1/channels", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: channelID }),
+      signal: authController.signal,
+    });
+    if (generation !== authGeneration) return;
+    if (response.status === 401) {
+      showAccess("This device is no longer connected.");
+      return;
+    }
+    if (response.status === 409) throw new Error("that channel already exists");
+    if (!response.ok) throw new Error(await readError(response));
+    await loadChannels();
+    await switchChannel(channelID);
+  } catch (error) {
+    if (generation !== authGeneration || error.name === "AbortError") return;
+    sendError = `Could not create channel: ${error.message}`;
+    renderStatus();
+  }
+}
+
 async function loadMessages() {
-  if (loading || !currentDevice) return;
+  if (!currentDevice) return;
+  const channel = activeChannel;
+  // A switch may start its own load while the previous channel is still in
+  // flight; per-channel throttling keeps the poll from piling up.
+  if (loading && loadingChannel === channel) return;
   const generation = authGeneration;
   loading = true;
+  loadingChannel = channel;
   const nearBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 140;
   try {
-    const response = await authenticatedFetch(`/api/v1/messages?after=${cursor}&after_retraction=${retractionCursor}&limit=200`, { cache: "no-store", signal: authController.signal });
-    if (generation !== authGeneration) return;
+    const response = await authenticatedFetch(`/api/v1/messages?after=${cursor}&after_retraction=${retractionCursor}&limit=200&${channelQuery()}`, { cache: "no-store", signal: authController.signal });
+    if (generation !== authGeneration || channel !== activeChannel) return;
     if (response.status === 401) {
       showAccess("This device is no longer connected.");
       return;
@@ -670,13 +848,16 @@ async function loadMessages() {
     connectionError = error.message;
     renderStatus();
   } finally {
-    loading = false;
+    if (loadingChannel === channel) {
+      loading = false;
+      loadingChannel = "";
+    }
   }
 }
 
 async function sendText(text) {
   const generation = authGeneration;
-  const response = await authenticatedFetch("/api/v1/messages/text", {
+  const response = await authenticatedFetch(`/api/v1/messages/text?${channelQuery()}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text }),
@@ -692,7 +873,7 @@ async function sendFile(file) {
   const generation = authGeneration;
   const form = new FormData();
   form.append("file", file, file.name);
-  const response = await authenticatedFetch("/api/v1/messages/file", { method: "POST", body: form, signal: authController.signal });
+  const response = await authenticatedFetch(`/api/v1/messages/file?${channelQuery()}`, { method: "POST", body: form, signal: authController.signal });
   if (generation !== authGeneration) return false;
   if (response.status === 401) showAccess("This device is no longer connected.");
   if (!response.ok) throw new Error(await readError(response));
@@ -718,6 +899,7 @@ async function loadSession() {
     if (!response.ok) throw new Error(await readError(response));
     const payload = await response.json();
     showApp(payload.device);
+    await loadChannels();
     await loadMessages();
   } catch (error) {
     if (generation !== authGeneration || token !== deviceToken || error.name === "AbortError") return;
@@ -759,18 +941,26 @@ function showJoinFailure(error) {
 
 async function joinAccess(password) {
   if (!storageWritable()) throw new Error("Browser storage is unavailable. Enable site storage before connecting this device.");
+  const joinChannel = channelFromURL();
+  const body = { device_name: deviceNameInput.value, password };
+  if (joinChannel) body.channel = joinChannel;
   const response = await fetch("/api/v1/access/join", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Ferry-Device-Kind": localDeviceKind },
-    body: JSON.stringify({ device_name: deviceNameInput.value, password }),
+    body: JSON.stringify(body),
   });
   if (!response.ok) throw await responseError(response);
   const payload = await response.json();
   accessPasswordInput.value = "";
   resetTimeline();
+  if (joinChannel) {
+    activeChannel = joinChannel;
+    storeChannel(joinChannel);
+  }
   deviceToken = payload.token;
   storageError = storeToken(payload.token) ? "" : "Browser storage is unavailable. Keep this tab open until you reconnect.";
   showApp(payload.device);
+  await loadChannels();
   await loadMessages();
 }
 
@@ -798,7 +988,7 @@ accessForm.addEventListener("submit", async (event) => {
 
 async function loadDevices() {
   const generation = authGeneration;
-  const response = await authenticatedFetch("/api/v1/devices", { cache: "no-store", signal: authController.signal });
+  const response = await authenticatedFetch(`/api/v1/devices?${channelQuery()}`, { cache: "no-store", signal: authController.signal });
   if (generation !== authGeneration) return;
   if (response.status === 401) {
     showAccess("This device is no longer connected.");
@@ -834,7 +1024,7 @@ async function loadDevices() {
         revoke.disabled = true;
         const generation = authGeneration;
         try {
-          const result = await authenticatedFetch(`/api/v1/devices/${device.id}`, { method: "DELETE", signal: authController.signal });
+          const result = await authenticatedFetch(`/api/v1/devices/${device.id}?${channelQuery()}`, { method: "DELETE", signal: authController.signal });
           if (generation !== authGeneration) return;
           if (result.status === 401) {
             showAccess("This device is no longer connected.");
@@ -855,6 +1045,8 @@ async function loadDevices() {
 }
 
 timelineButton.addEventListener("click", () => selectView("timeline"));
+
+newChannelButton.addEventListener("click", createChannel);
 
 deviceButton.addEventListener("click", openDevices);
 welcomeConnectButton.addEventListener("click", openDevices);
@@ -884,8 +1076,15 @@ async function openDevices() {
 // The address another device should open is the one this browser is using.
 // location.origin carries no path, query or fragment, and the device token
 // lives in localStorage, so neither the token nor a password can leak into it.
+// The QR code and the copyable address carry the active channel, so a device
+// that joins from them lands in the timeline it was invited to.
+function connectAddress() {
+  const base = location.origin;
+  return activeChannel && activeChannel !== "default" ? `${base}/?channel=${encodeURIComponent(activeChannel)}` : base;
+}
+
 function renderConnectSection() {
-  const address = location.origin;
+  const address = connectAddress();
   serverAddressInput.value = address;
   connectQR.replaceChildren();
   connectQR.hidden = true;

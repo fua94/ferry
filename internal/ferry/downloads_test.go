@@ -21,11 +21,11 @@ func TestDownloadLinkGrantsOneFileWithoutBearerUntilExpiryOrRevocation(t *testin
 	}
 	owner := join("Owner")
 	phone := join("Phone")
-	file, err := store.CreateFileForDevice(t.Context(), owner.Device, "notes.txt", "text/plain", strings.NewReader("ferry file\n"))
+	file, err := store.CreateFileForDevice(t.Context(), owner.Device, DefaultChannelID, "notes.txt", "text/plain", strings.NewReader("ferry file\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	text, err := store.CreateTextForDevice(t.Context(), owner.Device, "hello")
+	text, err := store.CreateTextForDevice(t.Context(), owner.Device, DefaultChannelID, "hello")
 	if err != nil {
 		t.Fatal(err)
 	}

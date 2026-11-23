@@ -89,7 +89,7 @@ func TestStaleDeviceCannotChangeAccessSettings(t *testing.T) {
 	}
 	revoked := create("Revoked")
 	owner := create("Owner")
-	if err := store.DeleteDevice(t.Context(), owner.ID, revoked.ID); err != nil {
+	if err := store.DeleteDevice(t.Context(), owner.ID, DefaultChannelID, revoked.ID); err != nil {
 		t.Fatal(err)
 	}
 	request := httptest.NewRequest(http.MethodPut, "http://127.0.0.1/api/v1/settings/access", strings.NewReader(`{"password":"stolen"}`))

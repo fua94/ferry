@@ -17,6 +17,9 @@ const (
 	MaxSenderBytes = 64
 	MaxFileBytes   = 64 << 20
 	MaxFileName    = 255
+	// MaxChannelIDBytes is the longest accepted channel slug, which is also
+	// the CHECK bound on channels.id.
+	MaxChannelIDBytes = 32
 )
 
 var (
@@ -24,6 +27,9 @@ var (
 	ErrTooLarge     = errors.New("input too large")
 	ErrNotFound     = errors.New("not found")
 	ErrUnauthorized = errors.New("unauthorized")
+	// ErrConflict reports a unique row that already exists, such as a channel
+	// slug. Handlers turn it into 409 rather than pretending the create worked.
+	ErrConflict = errors.New("already exists")
 )
 
 type Kind string
@@ -69,6 +75,50 @@ type Device struct {
 	Name      string     `json:"name"`
 	Kind      DeviceKind `json:"kind"`
 	CreatedAt string     `json:"created_at"`
+}
+
+// DefaultChannelID is the timeline every pre-channel client sees. It always
+// exists, and every device that predates channels is a member of it.
+const DefaultChannelID = "default"
+
+// Channel is one timeline. Its identifier is its visible name: a lowercase
+// slug, so clients never need a separate display name to address it. Joined
+// says whether the asking device is a member; the channel list shows every
+// channel on the server, like a Slack sidebar.
+type Channel struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	CreatedAt string `json:"created_at"`
+	Joined    bool   `json:"joined"`
+}
+
+// normalizeChannelID accepts exactly the stored slug shape:
+// ^[a-z0-9][a-z0-9-]{0,31}$. Everything else, including uppercase or padding,
+// is rejected rather than silently rewritten, so a mistyped channel is a 400
+// instead of a second, seemingly equivalent channel.
+func normalizeChannelID(value string) (string, error) {
+	if value == "" {
+		return "", fmt.Errorf("%w: channel is required", ErrInvalid)
+	}
+	if len(value) > MaxChannelIDBytes {
+		return "", fmt.Errorf("%w: channel exceeds %d bytes", ErrInvalid, MaxChannelIDBytes)
+	}
+	for index, char := range value {
+		first := index == 0
+		if char >= 'a' && char <= 'z' || char >= '0' && char <= '9' {
+			continue
+		}
+		if char == '-' && !first {
+			continue
+		}
+		return "", fmt.Errorf("%w: channel must be a lowercase slug of letters, digits, and inner hyphens", ErrInvalid)
+	}
+	return value, nil
+}
+
+func validChannelID(value string) bool {
+	normalized, err := normalizeChannelID(value)
+	return err == nil && normalized == value
 }
 
 func normalizeDeviceKind(value string, deviceName string) (DeviceKind, error) {

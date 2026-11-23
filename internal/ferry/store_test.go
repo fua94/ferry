@@ -59,7 +59,7 @@ func TestLegacyDatabaseMigratesDeviceKindsAndInfersHistory(t *testing.T) {
 	if err != nil || device.Kind != DeviceKindMac {
 		t.Fatalf("legacy device = %#v, error = %v", device, err)
 	}
-	messages, _, err := store.ListMessages(t.Context(), 0, 10)
+	messages, _, err := store.ListMessages(t.Context(), DefaultChannelID, 0, 10)
 	if err != nil || len(messages) != 1 || messages[0].SenderKind != DeviceKindIPhone {
 		t.Fatalf("legacy messages = %#v, error = %v", messages, err)
 	}
@@ -97,7 +97,7 @@ func TestLegacyDatabaseMigratesDeviceKindsAndInfersHistory(t *testing.T) {
 	if _, err := reopened.db.Exec("UPDATE messages SET sender_device_id = 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz'"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := reopened.ListMessages(t.Context(), 0, 10); err == nil || !strings.Contains(err.Error(), "stored sender device id is invalid") {
+	if _, _, err := reopened.ListMessages(t.Context(), DefaultChannelID, 0, 10); err == nil || !strings.Contains(err.Error(), "stored sender device id is invalid") {
 		t.Fatalf("corrupt sender device id error = %v", err)
 	}
 }
@@ -188,14 +188,14 @@ func TestFileNameCannotSelectBlobPathAndPersists(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { reopened.Close() })
-	messages, cursor, err := reopened.ListMessages(ctx, 0, 100)
+	messages, cursor, err := reopened.ListMessages(ctx, DefaultChannelID, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(messages) != 1 || cursor != message.Sequence || messages[0].ID != message.ID {
 		t.Fatalf("reopened messages = %#v, cursor = %d", messages, cursor)
 	}
-	_, file, err := reopened.OpenFile(ctx, message.ID)
+	_, file, err := reopened.OpenFile(ctx, DefaultChannelID, message.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +276,7 @@ func TestCorruptStoredFileMetadataFailsClosed(t *testing.T) {
 	if _, err := store.db.ExecContext(ctx, "UPDATE messages SET file_size = ? WHERE id = ?", MaxFileBytes+1, message.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.ListMessages(ctx, 0, 100); err == nil || !strings.Contains(err.Error(), "stored file message is invalid") {
+	if _, _, err := store.ListMessages(ctx, DefaultChannelID, 0, 100); err == nil || !strings.Contains(err.Error(), "stored file message is invalid") {
 		t.Fatalf("ListMessages() error = %v, want invalid stored file", err)
 	}
 }
@@ -291,7 +291,7 @@ func TestBlobSizeMismatchFailsBeforeDownload(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(store.blobsDir, message.ID+".blob"), []byte("changed"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, file, err := store.OpenFile(ctx, message.ID); err == nil || file != nil || !strings.Contains(err.Error(), "size does not match") {
+	if _, file, err := store.OpenFile(ctx, DefaultChannelID, message.ID); err == nil || file != nil || !strings.Contains(err.Error(), "size does not match") {
 		t.Fatalf("OpenFile() file = %v, error = %v", file, err)
 	}
 }
@@ -308,7 +308,7 @@ func TestUnknownStoredKindFailsClosed(t *testing.T) {
     `); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.ListMessages(ctx, 0, 100); err == nil || !strings.Contains(err.Error(), "unknown stored message kind") {
+	if _, _, err := store.ListMessages(ctx, DefaultChannelID, 0, 100); err == nil || !strings.Contains(err.Error(), "unknown stored message kind") {
 		t.Fatalf("ListMessages() error = %v, want unknown kind failure", err)
 	}
 }
@@ -327,7 +327,7 @@ func TestCursorOrdersMessagesIndependentlyOfTimestamp(t *testing.T) {
 	if _, err := store.db.ExecContext(ctx, "UPDATE messages SET created_at = '2026-08-29T00:00:00Z'"); err != nil {
 		t.Fatal(err)
 	}
-	messages, cursor, err := store.ListMessages(ctx, first.Sequence, 100)
+	messages, cursor, err := store.ListMessages(ctx, DefaultChannelID, first.Sequence, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +374,7 @@ func TestDeviceTokenPersistsAsHashAndRevokesImmediately(t *testing.T) {
 	if err != nil || authenticated.ID != device.ID {
 		t.Fatalf("authenticated = %#v, error = %v", authenticated, err)
 	}
-	devices, err := reopened.ListDevices(ctx)
+	devices, err := reopened.ListDevices(ctx, DefaultChannelID)
 	if err != nil || len(devices) != 1 || devices[0].ID != device.ID {
 		t.Fatalf("devices = %#v, error = %v", devices, err)
 	}
@@ -386,16 +386,16 @@ func TestDeviceTokenPersistsAsHashAndRevokesImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reopened.DeleteDevice(ctx, second.ID, device.ID); err != nil {
+	if err := reopened.DeleteDevice(ctx, second.ID, DefaultChannelID, device.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reopened.AuthenticateDevice(ctx, hash); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("authentication after revoke error = %v", err)
 	}
-	if err := reopened.DeleteDevice(ctx, second.ID, device.ID); !errors.Is(err, ErrNotFound) {
+	if err := reopened.DeleteDevice(ctx, second.ID, DefaultChannelID, device.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second delete error = %v", err)
 	}
-	if err := reopened.DeleteDevice(ctx, second.ID, second.ID); !errors.Is(err, ErrInvalid) {
+	if err := reopened.DeleteDevice(ctx, second.ID, DefaultChannelID, second.ID); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("self delete error = %v", err)
 	}
 }
@@ -444,7 +444,7 @@ func TestDeviceCreationRequiresIssuerAtInsertTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteDevice(ctx, owner.ID, issuer.ID); err != nil {
+	if err := store.DeleteDevice(ctx, owner.ID, DefaultChannelID, issuer.ID); err != nil {
 		t.Fatal(err)
 	}
 	_, claimedHash, err := newDeviceToken()
@@ -477,13 +477,13 @@ func TestRevokedRequesterCannotDeleteAnotherDevice(t *testing.T) {
 	first := create("First")
 	second := create("Second")
 	third := create("Third")
-	if err := store.DeleteDevice(ctx, second.ID, first.ID); err != nil {
+	if err := store.DeleteDevice(ctx, second.ID, DefaultChannelID, first.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteDevice(ctx, first.ID, second.ID); !errors.Is(err, ErrUnauthorized) {
+	if err := store.DeleteDevice(ctx, first.ID, DefaultChannelID, second.ID); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("revoked requester delete error = %v", err)
 	}
-	devices, err := store.ListDevices(ctx)
+	devices, err := store.ListDevices(ctx, DefaultChannelID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -505,10 +505,10 @@ func TestMessageKindMustMatchPersistedDeviceKind(t *testing.T) {
 	}
 	forged := explicit
 	forged.Kind = DeviceKindIPhone
-	if _, err := store.CreateTextForDevice(ctx, forged, "must not land"); !errors.Is(err, ErrUnauthorized) {
+	if _, err := store.CreateTextForDevice(ctx, forged, DefaultChannelID, "must not land"); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("forged text kind error = %v, want ErrUnauthorized", err)
 	}
-	if _, err := store.CreateFileForDevice(ctx, forged, "forged.txt", "text/plain", strings.NewReader("must not land")); !errors.Is(err, ErrUnauthorized) {
+	if _, err := store.CreateFileForDevice(ctx, forged, DefaultChannelID, "forged.txt", "text/plain", strings.NewReader("must not land")); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("forged file kind error = %v, want ErrUnauthorized", err)
 	}
 
@@ -527,15 +527,15 @@ func TestMessageKindMustMatchPersistedDeviceKind(t *testing.T) {
 	if err != nil || legacy.Kind != DeviceKindIPhone {
 		t.Fatalf("legacy device = %#v, error = %v", legacy, err)
 	}
-	if _, err := store.CreateTextForDevice(ctx, legacy, "legacy lands"); err != nil {
+	if _, err := store.CreateTextForDevice(ctx, legacy, DefaultChannelID, "legacy lands"); err != nil {
 		t.Fatalf("legacy inferred kind rejected: %v", err)
 	}
 	legacy.Kind = DeviceKindMac
-	if _, err := store.CreateTextForDevice(ctx, legacy, "forged legacy kind"); !errors.Is(err, ErrUnauthorized) {
+	if _, err := store.CreateTextForDevice(ctx, legacy, DefaultChannelID, "forged legacy kind"); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("forged legacy kind error = %v, want ErrUnauthorized", err)
 	}
 
-	messages, _, err := store.ListMessages(ctx, 0, 10)
+	messages, _, err := store.ListMessages(ctx, DefaultChannelID, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,17 +568,17 @@ func TestRevokedDeviceCannotCreateMessages(t *testing.T) {
 	}
 	revoked := create("Revoked")
 	owner := create("Owner")
-	if err := store.DeleteDevice(ctx, owner.ID, revoked.ID); err != nil {
+	if err := store.DeleteDevice(ctx, owner.ID, DefaultChannelID, revoked.ID); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := store.CreateTextForDevice(ctx, revoked, "must not land"); !errors.Is(err, ErrUnauthorized) {
+	if _, err := store.CreateTextForDevice(ctx, revoked, DefaultChannelID, "must not land"); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("CreateTextForDevice() error = %v, want ErrUnauthorized", err)
 	}
-	if _, err := store.CreateFileForDevice(ctx, revoked, "secret.txt", "text/plain", strings.NewReader("must not land")); !errors.Is(err, ErrUnauthorized) {
+	if _, err := store.CreateFileForDevice(ctx, revoked, DefaultChannelID, "secret.txt", "text/plain", strings.NewReader("must not land")); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("CreateFileForDevice() error = %v, want ErrUnauthorized", err)
 	}
-	messages, _, err := store.ListMessages(ctx, 0, 10)
+	messages, _, err := store.ListMessages(ctx, DefaultChannelID, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -615,7 +615,7 @@ func TestRevokingDeviceDuringFileUploadPreventsMessageAndBlob(t *testing.T) {
 	release := make(chan struct{})
 	result := make(chan error, 1)
 	go func() {
-		_, err := store.CreateFileForDevice(ctx, uploader, "slow.txt", "text/plain", &gatedReader{
+		_, err := store.CreateFileForDevice(ctx, uploader, DefaultChannelID, "slow.txt", "text/plain", &gatedReader{
 			started: started,
 			release: release,
 			data:    []byte("must not land"),
@@ -623,14 +623,14 @@ func TestRevokingDeviceDuringFileUploadPreventsMessageAndBlob(t *testing.T) {
 		result <- err
 	}()
 	<-started
-	if err := store.DeleteDevice(ctx, owner.ID, uploader.ID); err != nil {
+	if err := store.DeleteDevice(ctx, owner.ID, DefaultChannelID, uploader.ID); err != nil {
 		t.Fatal(err)
 	}
 	close(release)
 	if err := <-result; !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("in-flight upload error = %v, want ErrUnauthorized", err)
 	}
-	messages, _, err := store.ListMessages(ctx, 0, 10)
+	messages, _, err := store.ListMessages(ctx, DefaultChannelID, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -671,7 +671,7 @@ func TestConcurrentCrossRevokeCannotRemoveEveryDevice(t *testing.T) {
 		group.Add(1)
 		go func(requester, target string) {
 			defer group.Done()
-			errorsSeen <- store.DeleteDevice(ctx, requester, target)
+			errorsSeen <- store.DeleteDevice(ctx, requester, DefaultChannelID, target)
 		}(pair[0], pair[1])
 	}
 	group.Wait()
@@ -684,7 +684,7 @@ func TestConcurrentCrossRevokeCannotRemoveEveryDevice(t *testing.T) {
 			t.Fatalf("cross revoke error = %v", err)
 		}
 	}
-	devices, err := store.ListDevices(ctx)
+	devices, err := store.ListDevices(ctx, DefaultChannelID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -719,7 +719,7 @@ func TestOpeningPreAuthDataAddsDevicesWithoutLosingMessages(t *testing.T) {
 	if err != nil || count != 0 {
 		t.Fatalf("device count = %d, error = %v", count, err)
 	}
-	messages, _, err := reopened.ListMessages(ctx, 0, 10)
+	messages, _, err := reopened.ListMessages(ctx, DefaultChannelID, 0, 10)
 	if err != nil || len(messages) != 1 || messages[0].ID != message.ID {
 		t.Fatalf("messages = %#v, error = %v", messages, err)
 	}
@@ -735,15 +735,15 @@ func TestAuthenticatedMessagesPersistSenderDeviceIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	text, err := store.CreateTextForDevice(t.Context(), device, "text identity")
+	text, err := store.CreateTextForDevice(t.Context(), device, DefaultChannelID, "text identity")
 	if err != nil {
 		t.Fatal(err)
 	}
-	file, err := store.CreateFileForDevice(t.Context(), device, "identity.txt", "text/plain", strings.NewReader("file identity"))
+	file, err := store.CreateFileForDevice(t.Context(), device, DefaultChannelID, "identity.txt", "text/plain", strings.NewReader("file identity"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	messages, _, err := store.ListMessages(t.Context(), 0, 10)
+	messages, _, err := store.ListMessages(t.Context(), DefaultChannelID, 0, 10)
 	if err != nil || len(messages) != 2 {
 		t.Fatalf("messages = %#v, error = %v", messages, err)
 	}

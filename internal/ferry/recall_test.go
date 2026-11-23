@@ -16,11 +16,11 @@ func TestSharedRecallCursorAndFileAccess(t *testing.T) {
 		return decodeClaim(t, requestJSON(t, handler, http.MethodPost, "/api/v1/access/join", `{"device_name":"Same Mac","password":""}`))
 	}
 	owner, peer := join(), join()
-	file, err := store.CreateFileForDevice(t.Context(), owner.Device, "original.txt", "text/plain", strings.NewReader("original bytes"))
+	file, err := store.CreateFileForDevice(t.Context(), owner.Device, DefaultChannelID, "original.txt", "text/plain", strings.NewReader("original bytes"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	later, err := store.CreateTextForDevice(t.Context(), owner.Device, "keep this")
+	later, err := store.CreateTextForDevice(t.Context(), owner.Device, DefaultChannelID, "keep this")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,16 +43,16 @@ func TestSharedRecallCursorAndFileAccess(t *testing.T) {
 	if len(payload.Messages) != 0 || len(payload.IDs) != 1 || payload.IDs[0] != file.ID || payload.Cursor == 0 {
 		t.Fatalf("missed old recall: %#v", payload)
 	}
-	ids, next, err := store.ListRetractions(t.Context(), payload.Cursor, 1)
+	ids, next, err := store.ListRetractions(t.Context(), DefaultChannelID, payload.Cursor, 1)
 	if err != nil || len(ids) != 0 || next != payload.Cursor {
 		t.Fatalf("retry duplicated recall: %v %d %v", ids, next, err)
 	}
 	assertStatus(t, authenticatedRequest(t, handler, http.MethodGet, "/api/v1/messages?after_retraction=-1", "", owner.Token), http.StatusBadRequest)
-	if err := store.DeleteDevice(t.Context(), peer.Device.ID, owner.Device.ID); err != nil {
+	if err := store.DeleteDevice(t.Context(), peer.Device.ID, DefaultChannelID, owner.Device.ID); err != nil {
 		t.Fatal(err)
 	}
 	// Bypass middleware to reproduce a request authenticated before revocation.
-	if err := store.RetractMessage(t.Context(), owner.Device.ID, later.ID); !errors.Is(err, ErrUnauthorized) {
+	if err := store.RetractMessage(t.Context(), owner.Device.ID, DefaultChannelID, later.ID); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("stale requester: %v", err)
 	}
 }
@@ -74,17 +74,17 @@ func TestRecallPaginationAndRestartCleanup(t *testing.T) {
 	}
 	var expected []string
 	for range 3 {
-		message, err := store.CreateTextForDevice(t.Context(), owner, "recall me")
+		message, err := store.CreateTextForDevice(t.Context(), owner, DefaultChannelID, "recall me")
 		if err != nil {
 			t.Fatal(err)
 		}
 		expected = append(expected, message.ID)
-		if err := store.RetractMessage(t.Context(), owner.ID, message.ID); err != nil {
+		if err := store.RetractMessage(t.Context(), owner.ID, DefaultChannelID, message.ID); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// Simulate a stop after intent is committed but before unlink/finalise.
-	pending, err := store.CreateFileForDevice(t.Context(), owner, "pending.txt", "text/plain", strings.NewReader("interrupted unlink"))
+	pending, err := store.CreateFileForDevice(t.Context(), owner, DefaultChannelID, "pending.txt", "text/plain", strings.NewReader("interrupted unlink"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,13 +105,13 @@ func TestRecallPaginationAndRestartCleanup(t *testing.T) {
 	}
 	cursor := int64(0)
 	for _, id := range expected {
-		ids, next, err := store.ListRetractions(t.Context(), cursor, 1)
+		ids, next, err := store.ListRetractions(t.Context(), DefaultChannelID, cursor, 1)
 		if err != nil || len(ids) != 1 || ids[0] != id || next <= cursor {
 			t.Fatalf("lost recall: %v %d %v", ids, next, err)
 		}
 		cursor = next
 	}
-	messages, _, err := store.ListMessages(t.Context(), 0, 100)
+	messages, _, err := store.ListMessages(t.Context(), DefaultChannelID, 0, 100)
 	if err != nil || len(messages) != 0 {
 		t.Fatalf("recalled content survived restart: %v %v", messages, err)
 	}
@@ -127,7 +127,7 @@ func TestFailedRecallRemainsRetryableWithoutSkippingItsSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := store.CreateTextForDevice(t.Context(), owner, "retry me")
+	first, err := store.CreateTextForDevice(t.Context(), owner, DefaultChannelID, "retry me")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,35 +138,35 @@ func TestFailedRecallRemainsRetryableWithoutSkippingItsSequence(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(blocked, "block"), []byte("block unlink"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RetractMessage(t.Context(), owner.ID, first.ID); err == nil {
+	if err := store.RetractMessage(t.Context(), owner.ID, DefaultChannelID, first.ID); err == nil {
 		t.Fatal("expected unlink failure")
 	}
-	messages, _, err := store.ListMessages(t.Context(), 0, 10)
+	messages, _, err := store.ListMessages(t.Context(), DefaultChannelID, 0, 10)
 	if err != nil || len(messages) != 1 {
 		t.Fatalf("failure lost retry control: %v %v", messages, err)
 	}
-	ids, _, err := store.ListRetractions(t.Context(), 0, 10)
+	ids, _, err := store.ListRetractions(t.Context(), DefaultChannelID, 0, 10)
 	if err != nil || len(ids) != 0 {
 		t.Fatalf("published failed recall: %v %v", ids, err)
 	}
-	second, err := store.CreateTextForDevice(t.Context(), owner, "finish first")
+	second, err := store.CreateTextForDevice(t.Context(), owner, DefaultChannelID, "finish first")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RetractMessage(t.Context(), owner.ID, second.ID); err != nil {
+	if err := store.RetractMessage(t.Context(), owner.ID, DefaultChannelID, second.ID); err != nil {
 		t.Fatal(err)
 	}
-	_, cursor, err := store.ListRetractions(t.Context(), 0, 10)
+	_, cursor, err := store.ListRetractions(t.Context(), DefaultChannelID, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.RemoveAll(blocked); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RetractMessage(t.Context(), owner.ID, first.ID); err != nil {
+	if err := store.RetractMessage(t.Context(), owner.ID, DefaultChannelID, first.ID); err != nil {
 		t.Fatal(err)
 	}
-	ids, next, err := store.ListRetractions(t.Context(), cursor, 10)
+	ids, next, err := store.ListRetractions(t.Context(), DefaultChannelID, cursor, 10)
 	if err != nil || len(ids) != 1 || ids[0] != first.ID || next <= cursor {
 		t.Fatalf("retry fell behind cursor: %v %d %v", ids, next, err)
 	}
@@ -186,10 +186,10 @@ func TestSharedRecallAlsoRemovesLegacyMessages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RetractMessage(t.Context(), device.ID, legacy.ID); err != nil {
+	if err := store.RetractMessage(t.Context(), device.ID, DefaultChannelID, legacy.ID); err != nil {
 		t.Fatal(err)
 	}
-	messages, _, err := store.ListMessages(t.Context(), 0, 10)
+	messages, _, err := store.ListMessages(t.Context(), DefaultChannelID, 0, 10)
 	if err != nil || len(messages) != 0 {
 		t.Fatalf("legacy recall failed: %v %v", messages, err)
 	}

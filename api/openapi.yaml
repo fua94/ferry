@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Ferry API
-  version: 0.5.0
+  version: 0.6.0
 servers:
   - url: http://127.0.0.1:8080
 security:
@@ -49,16 +49,81 @@ paths:
               properties:
                 device_name: { type: string, minLength: 1, description: At most 64 UTF-8 bytes after trimming; control characters are rejected. }
                 password: { type: string, description: Empty when password access is disabled; otherwise the exact shared password, at most 256 UTF-8 bytes. }
+                channel: { $ref: "#/components/schemas/ChannelID" }
               additionalProperties: false
       responses:
         "201":
-          description: Device connected; token is returned once for origin-scoped client storage.
+          description: Device connected and joined to the requested channel (default when the field is absent); token is returned once for origin-scoped client storage.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/AccessClaim" }
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+  /api/v1/channels:
+    get:
+      description: Every channel on the server, ordered by creation time then id, with a `joined` flag for the requesting device. Names are not secret on a trusted LAN; timeline contents still need membership.
+      responses:
+        "200":
+          description: Visible channels
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [channels]
+                properties:
+                  channels:
+                    type: array
+                    items: { $ref: "#/components/schemas/Channel" }
+                additionalProperties: false
+        "401": { $ref: "#/components/responses/Error" }
+    post:
+      description: Creates a channel and joins the requesting device to it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { $ref: "#/components/schemas/ChannelID" }
+              additionalProperties: false
+      responses:
+        "201":
+          description: Created channel
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Channel" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+  /api/v1/channels/join:
+    post:
+      description: Adds the requesting device to a channel that already exists, so it can read a second timeline without registering again. Unknown and non-existent channels both answer 404.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel]
+              properties:
+                channel: { $ref: "#/components/schemas/ChannelID" }
+              additionalProperties: false
+      responses:
+        "204":
+          description: Device joined the channel (idempotent)
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
         "413": { $ref: "#/components/responses/Error" }
         "415": { $ref: "#/components/responses/Error" }
   /api/v1/session:
@@ -107,6 +172,8 @@ paths:
         "415": { $ref: "#/components/responses/Error" }
   /api/v1/devices:
     get:
+      parameters:
+        - $ref: "#/components/parameters/ChannelQuery"
       responses:
         "200":
           description: Connected devices.
@@ -128,6 +195,7 @@ paths:
           in: path
           required: true
           schema: { type: string, pattern: "^[0-9a-f]{32}$" }
+        - $ref: "#/components/parameters/ChannelQuery"
       responses:
         "204": { description: Another device was revoked. }
         "401": { $ref: "#/components/responses/Error" }
@@ -137,6 +205,7 @@ paths:
   /api/v1/messages:
     get:
       parameters:
+        - $ref: "#/components/parameters/ChannelQuery"
         - name: after
           in: query
           schema: { type: integer, minimum: 0, default: 0 }
@@ -189,6 +258,8 @@ paths:
         "404": { $ref: "#/components/responses/Error" }
   /api/v1/messages/text:
     post:
+      parameters:
+        - $ref: "#/components/parameters/ChannelQuery"
       requestBody:
         required: true
         content:
@@ -215,6 +286,8 @@ paths:
         "415": { $ref: "#/components/responses/Error" }
   /api/v1/messages/file:
     post:
+      parameters:
+        - $ref: "#/components/parameters/ChannelQuery"
       requestBody:
         required: true
         content:
@@ -245,6 +318,7 @@ paths:
           in: path
           required: true
           schema: { type: string, pattern: "^[0-9a-f]{32}$" }
+        - $ref: "#/components/parameters/ChannelQuery"
       responses:
         "200":
           description: Original file bytes
@@ -260,6 +334,7 @@ paths:
           in: path
           required: true
           schema: { type: string, pattern: "^[0-9a-f]{32}$" }
+        - $ref: "#/components/parameters/ChannelQuery"
       responses:
         "201":
           description: Download link
@@ -289,7 +364,29 @@ components:
     deviceBearer:
       type: http
       scheme: bearer
+  parameters:
+    ChannelQuery:
+      name: channel
+      in: query
+      required: false
+      description: Channel slug. Absent or empty selects the default channel; an unknown channel or one this device has not joined answers 404.
+      schema: { $ref: "#/components/schemas/ChannelID" }
   schemas:
+    ChannelID:
+      type: string
+      pattern: "^[a-z0-9][a-z0-9-]{0,31}$"
+      description: Lowercase channel slug, 1 to 32 characters. The slug is also the visible channel name.
+    Channel:
+      type: object
+      required: [id, name, created_at, joined]
+      properties:
+        id: { $ref: "#/components/schemas/ChannelID" }
+        name: { $ref: "#/components/schemas/ChannelID" }
+        created_at: { type: string, format: date-time }
+        joined:
+          type: boolean
+          description: Whether the requesting device is a member. The list includes every channel on the server, like a Slack sidebar; reading a timeline still requires membership.
+      additionalProperties: false
     Device:
       type: object
       required: [id, name, kind, created_at]
