@@ -42,6 +42,14 @@ Los canales son **opt-in y aditivos**.
   - Un segundo `DELETE` del mismo id responde `404 not_found`, igual que el resto de borrados de
     la API; no hay idempotencia con `204`.
   - Un id con formato inválido responde `400 invalid_request`.
+- `DELETE /api/v1/channels/{channel_id}/messages` vacía la línea de tiempo del canal sin borrarlo.
+  Dentro de una transacción lee sus mensajes, inserta una retraction por cada uno con una secuencia
+  posterior al máximo global (de modo que `ListRetractions` se la entregue al resto de dispositivos
+  en su siguiente consulta) y borra los mensajes. Los blobs de los archivos se eliminan del disco
+  después del commit y se conservan la fila del canal y las filas de `device_channels`; las
+  retractions ya existentes no se borran. A diferencia del borrado de canal, `default` sí se puede
+  limpiar. Un canal vacío responde `204` idempotente, un canal inexistente `404 not_found` y un id
+  con formato inválido `400 invalid_request`.
 - Cualquier dispositivo autenticado puede retractar cualquier mensaje de cualquier canal. Se
   mantiene el modelo sin dueño en lugar de introducir roles.
 - La contraseña de acceso sigue siendo del servidor completo. Las contraseñas por canal serían un
@@ -55,6 +63,12 @@ Los canales son **opt-in y aditivos**.
 - Cada fila ofrece una acción de borrado con confirmación. `default` la muestra deshabilitada
   porque el servidor responde `409 channel_protected`; un `404` significa que el canal ya no
   existía y la lista se refresca. Si se borra el canal activo, la vista vuelve a `default`.
+- La limpieza vive en el header del canal, a la derecha del título, y actúa sobre el canal activo;
+  el sidebar conserva solo el borrado en cada fila. Vacía el timeline del canal, también el de
+  `default`, sin borrar el canal: el servidor publica una retraction por cada mensaje, elimina los
+  blobs y conserva la fila del canal. La confirmación nombra el canal y avisa de que los mensajes y
+  archivos desaparecen para todos los dispositivos. Si el canal limpiado es el activo, la vista se
+  recarga desde cero.
 - La dirección de conexión y el código QR siguen llevando el canal activo, de modo que un
   dispositivo que los escanee abre la línea de tiempo elegida en lugar de `default`.
 - Por debajo de 760 px el sidebar se convierte en un drawer off-canvas con un botón de apertura

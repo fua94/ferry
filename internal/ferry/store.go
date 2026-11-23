@@ -627,6 +627,88 @@ func (s *Store) DeleteChannel(ctx context.Context, id string) error {
 	return nil
 }
 
+// ClearChannel empties one channel's timeline without removing the channel row
+// or its legacy device_channels rows. In a single transaction it reads every
+// message (id and kind), persists one retraction per message with a sequence
+// above the global maximum so the other devices receive it on their next poll,
+// and deletes the messages. A retraction that was already published is left
+// untouched; an intent that is still pending gets that sequence. File blobs are
+// unlinked after the commit, exactly like DeleteChannel, so a failed unlink can
+// only leave an orphan file. Unlike DeleteChannel, the default channel can be
+// cleared; an unknown channel is ErrNotFound and an empty channel is a no-op.
+func (s *Store) ClearChannel(ctx context.Context, id string) error {
+	id, err := normalizeChannelID(id)
+	if err != nil {
+		return err
+	}
+	transaction, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin channel clear: %w", err)
+	}
+	defer transaction.Rollback()
+	var exists bool
+	if err := transaction.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM channels WHERE id = ?)", id).Scan(&exists); err != nil {
+		return fmt.Errorf("check channel clear: %w", err)
+	}
+	if !exists {
+		return ErrNotFound
+	}
+	rows, err := transaction.QueryContext(ctx, "SELECT id, kind FROM messages WHERE channel_id = ? ORDER BY sequence", id)
+	if err != nil {
+		return fmt.Errorf("read channel messages: %w", err)
+	}
+	var messageIDs []string
+	var blobs []string
+	for rows.Next() {
+		var messageID, kind string
+		if err := rows.Scan(&messageID, &kind); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan channel message: %w", err)
+		}
+		if !validID(messageID) {
+			rows.Close()
+			return fmt.Errorf("stored channel message id is invalid")
+		}
+		if kind != string(KindText) && kind != string(KindFile) {
+			rows.Close()
+			return fmt.Errorf("stored channel message kind is invalid")
+		}
+		messageIDs = append(messageIDs, messageID)
+		if kind == string(KindFile) {
+			blobs = append(blobs, filepath.Join(s.blobsDir, messageID+".blob"))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate channel messages: %w", err)
+	}
+	rows.Close()
+	var baseSequence int64
+	if err := transaction.QueryRowContext(ctx, "SELECT COALESCE(MAX(sequence), 0) FROM retractions").Scan(&baseSequence); err != nil {
+		return fmt.Errorf("read retraction sequence: %w", err)
+	}
+	for index, messageID := range messageIDs {
+		if _, err := transaction.ExecContext(ctx, `
+            INSERT INTO retractions (message_id, channel_id, sequence) VALUES (?, ?, ?)
+            ON CONFLICT(message_id) DO UPDATE SET sequence = excluded.sequence WHERE retractions.sequence IS NULL
+        `, messageID, id, baseSequence+int64(index)+1); err != nil {
+			return fmt.Errorf("insert channel retraction: %w", err)
+		}
+	}
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM messages WHERE channel_id = ?", id); err != nil {
+		return fmt.Errorf("delete channel messages: %w", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit channel clear: %w", err)
+	}
+	for _, path := range blobs {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("clear channel %s: remove blob %s: %v", id, path, err)
+		}
+	}
+	return nil
+}
+
 // ChannelOfMessage reports which channel owns a message, including one whose
 // content is already gone but whose retraction intent still names the channel.
 func (s *Store) ChannelOfMessage(ctx context.Context, id string) (string, error) {

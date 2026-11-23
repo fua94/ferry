@@ -43,6 +43,7 @@ const connectHint = document.querySelector("#connect-hint");
 const connectQR = document.querySelector("#connect-qr");
 const channelList = document.querySelector("#channel-list");
 const channelTitle = document.querySelector("#channel-title");
+const clearChatButton = document.querySelector("#clear-chat");
 const newChannelButton = document.querySelector("#new-channel");
 const sidebarToggle = document.querySelector("#sidebar-toggle");
 const sidebarClose = document.querySelector("#sidebar-close");
@@ -709,7 +710,8 @@ let knownChannels = [];
 // The picker lists every channel on the server. Channels are visibility, not
 // permission, so nothing is dimmed for lack of membership and clicking a row
 // only switches the timeline. Each row carries its own delete action, except
-// `default`, which the server protects.
+// `default`, which the server protects. Clearing is a header action for the
+// active channel, so it is reachable for `default` too.
 function renderChannelList(channels) {
   knownChannels = channels;
   const ids = channels.map((channel) => channel.id);
@@ -742,6 +744,8 @@ function renderChannelList(channels) {
     channelList.append(row);
   }
   channelTitle.textContent = `#${activeChannel}`;
+  clearChatButton.title = `Clear #${activeChannel} chat`;
+  clearChatButton.setAttribute("aria-label", `Clear #${activeChannel} chat`);
   // The connect address and QR embed the active channel, so they follow a switch.
   renderConnectSection();
   return activeChanged;
@@ -769,6 +773,8 @@ function channelDeleteButton(channel) {
 // refetching the list.
 function markActiveChannel() {
   channelTitle.textContent = `#${activeChannel}`;
+  clearChatButton.title = `Clear #${activeChannel} chat`;
+  clearChatButton.setAttribute("aria-label", `Clear #${activeChannel} chat`);
   for (const button of channelList.querySelectorAll(".channel-item")) {
     const isActive = button.dataset.channel === activeChannel;
     button.classList.toggle("is-active", isActive);
@@ -830,6 +836,46 @@ async function createChannel() {
   } catch (error) {
     if (generation !== authGeneration || error.name === "AbortError") return;
     sendError = `Could not create channel: ${error.message}`;
+    renderStatus();
+  }
+}
+
+// Clearing empties one timeline for every device but keeps the channel, so the
+// server also allows it for `default`. The confirmation names the channel; a 404
+// means another device removed the channel first, and the timeline is only
+// reloaded when the cleared channel is the one on screen.
+async function clearChannel(channelID) {
+  const channel = knownChannels.find((entry) => entry.id === channelID);
+  const name = channel ? channel.name : channelID;
+  if (!window.confirm(`Clear #${name}? All messages and attachments in this channel are removed for every device.`)) return;
+  sendError = "";
+  const generation = authGeneration;
+  try {
+    const response = await authenticatedFetch(`/api/v1/channels/${encodeURIComponent(channelID)}/messages`, {
+      method: "DELETE",
+      signal: authController.signal,
+    });
+    if (generation !== authGeneration) return;
+    if (response.status === 401) {
+      showAccess("This device is no longer connected.");
+      return;
+    }
+    if (response.status === 404) {
+      // Another device removed the channel first; reconcile the picker and the timeline.
+      await forgetChannel(channelID);
+      if (!sendError) sendError = `#${name} no longer exists. The channel list was refreshed.`;
+      renderStatus();
+      return;
+    }
+    if (!response.ok) throw new Error(await readError(response));
+    if (channelID === activeChannel) {
+      resetTimeline();
+      await loadMessages();
+    }
+    renderStatus();
+  } catch (error) {
+    if (generation !== authGeneration || error.name === "AbortError") return;
+    sendError = `Could not clear #${name}: ${error.message}`;
     renderStatus();
   }
 }
@@ -1129,6 +1175,7 @@ async function loadDevices() {
 timelineButton.addEventListener("click", () => selectView("timeline"));
 
 newChannelButton.addEventListener("click", createChannel);
+clearChatButton.addEventListener("click", () => clearChannel(activeChannel));
 
 deviceButton.addEventListener("click", openDevices);
 welcomeConnectButton.addEventListener("click", openDevices);

@@ -634,6 +634,97 @@ func TestHTTPDeleteChannelCascadesAndProtectsDefault(t *testing.T) {
 	}
 }
 
+func TestHTTPClearChannelEmptiesTimelineAndPublishesRetractions(t *testing.T) {
+	handler, store := newRawTestApp(t, false)
+	owner := decodeClaim(t, requestJSON(t, handler, http.MethodPost, "/api/v1/access/join", `{"device_name":"Owner","password":""}`))
+	if response := authenticatedRequest(t, handler, http.MethodPost, "/api/v1/channels", `{"name":"alpha"}`, owner.Token); response.Code != http.StatusCreated {
+		t.Fatalf("create alpha status = %d, body = %s", response.Code, response.Body.String())
+	}
+	alphaText, err := store.CreateTextForDevice(t.Context(), owner.Device, "alpha", "alpha text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	alphaFile, err := store.CreateFileForDevice(t.Context(), owner.Device, "alpha", "alpha.txt", "text/plain", strings.NewReader("alpha bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultText, err := store.CreateTextForDevice(t.Context(), owner.Device, DefaultChannelID, "keep default")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cleared := authenticatedRequest(t, handler, http.MethodDelete, "/api/v1/channels/alpha/messages", "", owner.Token)
+	assertStatus(t, cleared, http.StatusNoContent)
+	if cleared.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("clear response was cacheable")
+	}
+
+	list := authenticatedRequest(t, handler, http.MethodGet, "/api/v1/channels", "", owner.Token)
+	assertStatus(t, list, http.StatusOK)
+	var channels struct {
+		Channels []Channel `json:"channels"`
+	}
+	decodeResponse(t, list, &channels)
+	if len(channels.Channels) != 2 {
+		t.Fatalf("channels after clear = %#v", channels.Channels)
+	}
+	found := false
+	for _, channel := range channels.Channels {
+		if channel.ID == "alpha" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("alpha was removed from the channel list: %#v", channels.Channels)
+	}
+
+	page := authenticatedRequest(t, handler, http.MethodGet, "/api/v1/messages?channel=alpha", "", owner.Token)
+	assertStatus(t, page, http.StatusOK)
+	var clearedPage struct {
+		Messages     []Message `json:"messages"`
+		RetractedIDs []string  `json:"retracted_ids"`
+	}
+	decodeResponse(t, page, &clearedPage)
+	if len(clearedPage.Messages) != 0 {
+		t.Fatalf("alpha messages after clear = %#v", clearedPage.Messages)
+	}
+	retracted := map[string]bool{}
+	for _, id := range clearedPage.RetractedIDs {
+		retracted[id] = true
+	}
+	if !retracted[alphaText.ID] || !retracted[alphaFile.ID] {
+		t.Fatalf("alpha retractions = %#v, want %s and %s", clearedPage.RetractedIDs, alphaText.ID, alphaFile.ID)
+	}
+
+	if _, err := os.Stat(filepath.Join(store.blobsDir, alphaFile.ID+".blob")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("alpha blob still exists: %v", err)
+	}
+	if _, _, err := store.OpenFile(t.Context(), "alpha", alphaFile.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("OpenFile after clear error = %v, want ErrNotFound", err)
+	}
+	defaultMessages, _, err := store.ListMessages(t.Context(), DefaultChannelID, 0, 10)
+	if err != nil || len(defaultMessages) != 1 || defaultMessages[0].ID != defaultText.ID {
+		t.Fatalf("default messages after clear = %#v, error = %v", defaultMessages, err)
+	}
+
+	if response := authenticatedRequest(t, handler, http.MethodDelete, "/api/v1/channels/alpha/messages", "", owner.Token); response.Code != http.StatusNoContent {
+		t.Fatalf("second clear status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if response := authenticatedRequest(t, handler, http.MethodDelete, "/api/v1/channels/default/messages", "", owner.Token); response.Code != http.StatusNoContent {
+		t.Fatalf("clear default status = %d, body = %s", response.Code, response.Body.String())
+	}
+	defaultMessages, _, err = store.ListMessages(t.Context(), DefaultChannelID, 0, 10)
+	if err != nil || len(defaultMessages) != 0 {
+		t.Fatalf("default messages after clearing default = %#v, error = %v", defaultMessages, err)
+	}
+	if response := authenticatedRequest(t, handler, http.MethodDelete, "/api/v1/channels/missing/messages", "", owner.Token); response.Code != http.StatusNotFound || errorCode(t, response) != "not_found" {
+		t.Fatalf("missing clear status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if response := authenticatedRequest(t, handler, http.MethodDelete, "/api/v1/channels/Bad/messages", "", owner.Token); response.Code != http.StatusBadRequest || errorCode(t, response) != "invalid_request" {
+		t.Fatalf("invalid clear status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
 func TestHTTPWithoutChannelKeepsPreChannelBehaviour(t *testing.T) {
 	handler, _ := newRawTestApp(t, false)
 	owner := decodeClaim(t, requestJSON(t, handler, http.MethodPost, "/api/v1/access/join", `{"device_name":"Old Client","password":""}`))

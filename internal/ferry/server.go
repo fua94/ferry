@@ -65,6 +65,7 @@ func newHandler(store *Store, options HandlerOptions, now func() time.Time) http
 	api.HandleFunc("POST /api/v1/channels", s.createChannel)
 	api.HandleFunc("POST /api/v1/channels/join", s.joinChannel)
 	api.HandleFunc("DELETE /api/v1/channels/{channel_id}", s.deleteChannel)
+	api.HandleFunc("DELETE /api/v1/channels/{channel_id}/messages", s.clearChannel)
 	api.HandleFunc("DELETE /api/v1/messages/{message_id}", s.retractMessage)
 	api.HandleFunc("POST /api/v1/messages/text", s.createText)
 	api.HandleFunc("POST /api/v1/messages/file", s.createFile)
@@ -670,6 +671,28 @@ func (s *server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "channel_protected", "the default channel cannot be deleted")
 		return
 	}
+	if errors.Is(err, ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "channel was not found")
+		return
+	}
+	if errors.Is(err, ErrInvalid) {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if err != nil {
+		s.internalError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// clearChannel empties a channel's timeline but keeps the channel. Unlike
+// deleteChannel, `default` can be cleared. Every message is published as a
+// retraction, so other devices remove it on their next poll; an unknown channel
+// is 404 and an invalid slug is 400. Clearing an already empty channel is 204.
+func (s *server) clearChannel(w http.ResponseWriter, r *http.Request) {
+	err := s.store.ClearChannel(r.Context(), r.PathValue("channel_id"))
 	if errors.Is(err, ErrNotFound) {
 		writeError(w, http.StatusNotFound, "not_found", "channel was not found")
 		return

@@ -63,7 +63,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid #777; outline-off
 .channel-item.is-active { color: inherit; }
 .channel-hash { width: 19px; flex: 0 0 auto; color: var(--muted); text-align: center; }
 .channel-item > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* Every row carries its delete action so it is reachable with a finger too;
+/* Every row carries a delete action so it is reachable with a finger too;
    `default` renders it disabled because the server protects that channel. */
 .channel-delete { width: var(--touch-target); height: var(--touch-target); display: grid; place-items: center; flex: 0 0 auto; padding: 0; color: var(--muted); background: transparent; border: 0; border-radius: 10px; cursor: pointer; }
 .channel-delete:hover, .channel-delete:focus-visible { color: #c52c20; background: var(--hover); outline: 2px solid #777; outline-offset: -2px; }
@@ -338,6 +338,14 @@ textarea:disabled { color: var(--faint); }
 /* Channel picker: one row above the timeline, same width as the messages. */
 .channel-bar { width: min(704px, 100%); margin: 0 auto 18px; display: flex; align-items: center; gap: 8px; }
 .channel-title { min-width: 0; margin: 0; overflow: hidden; font-size: 17px; font-weight: 650; letter-spacing: -.02em; text-overflow: ellipsis; white-space: nowrap; }
+/* Clearing acts on the channel on screen, so it sits at the right edge of the
+   header instead of inside a sidebar row; that keeps it available for
+   `default`, whose row only offers the disabled delete. */
+.channel-clear { margin-left: auto; height: 36px; display: inline-flex; align-items: center; gap: 6px; padding: 0 12px; color: var(--muted); background: var(--raised); border: 1px solid var(--border); border-radius: 10px; cursor: pointer; font-size: 13px; white-space: nowrap; }
+.channel-clear:hover, .channel-clear:focus-visible { color: #111111; background: var(--hover); }
+.channel-clear svg { width: 17px; height: 17px; fill: none; stroke: #a35b00; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 @media (max-width: 760px) {
   .channel-bar { padding: 0 2px; }
+  .channel-clear { width: var(--touch-target); height: var(--touch-target); padding: 0; justify-content: center; }
+  .channel-clear span { display: none; }
 }

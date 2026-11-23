@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Ferry API
-  version: 0.6.0
+  version: 0.7.0
 servers:
   - url: http://127.0.0.1:8080
 security:
@@ -149,6 +149,21 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+  /api/v1/channels/{channel_id}/messages:
+    delete:
+      description: Empties a channel's timeline without removing the channel. In one transaction every message is published as a retraction with a sequence above the global maximum, so other devices remove it on their next poll, and the message rows are deleted. File blobs are unlinked after the commit, so download links issued for them stop resolving. The channel row and its legacy device_channels rows are kept. Unlike deleting a channel, the default channel can be cleared, and clearing an already empty channel is an idempotent 204. An unknown channel is 404 and an invalid slug is 400.
+      parameters:
+        - name: channel_id
+          in: path
+          required: true
+          schema: { $ref: "#/components/schemas/ChannelID" }
+      responses:
+        "204":
+          description: Timeline cleared, including an already empty channel.
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
   /api/v1/session:
     get:
       responses:

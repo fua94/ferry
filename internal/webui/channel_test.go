@@ -10,7 +10,8 @@ import (
 // The channel picker is a Slack-style list in the sidebar. Channels are
 // visibility rather than permission, so every channel appears undimmed, a click
 // only switches the timeline, and each row carries a delete action that leaves
-// `default` alone.
+// `default` alone. Clearing lives in the channel header and acts on the active
+// channel.
 func TestChannelPickerListsEveryChannelAndOffersDelete(t *testing.T) {
 	handler := Handler()
 	page := httptest.NewRecorder()
@@ -23,6 +24,8 @@ func TestChannelPickerListsEveryChannelAndOffersDelete(t *testing.T) {
 		`id="channel-list"`,
 		`class="sidebar-channels"`,
 		`id="channel-title"`,
+		`id="clear-chat"`,
+		`class="channel-clear"`,
 		`id="new-channel"`,
 		`class="sidebar-item channel-create"`,
 		// The drawer scaffolding: a visible opener, a close control and the
@@ -53,9 +56,12 @@ func TestChannelPickerListsEveryChannelAndOffersDelete(t *testing.T) {
 		`function renderChannelList(channels)`,
 		`function channelQuery()`,
 		`function channelDeleteButton(channel)`,
+		`querySelector("#clear-chat")`,
 		`async function deleteChannel(channelID)`,
+		`async function clearChannel(channelID)`,
 		`async function forgetChannel(channelID)`,
 		`newChannelButton.addEventListener("click", createChannel)`,
+		`clearChatButton.addEventListener("click", () => clearChannel(activeChannel))`,
 		`for (const channel of channels) {`,
 		`row.append(button, channelDeleteButton(channel))`,
 		`button.addEventListener("click", () => openChannel(channel.id))`,
@@ -71,6 +77,16 @@ func TestChannelPickerListsEveryChannelAndOffersDelete(t *testing.T) {
 		`if (response.status === 409)`,
 		`if (response.status === 404)`,
 		`await forgetChannel(channelID)`,
+		// Clearing: its own confirmation, the messages endpoint and a timeline
+		// reload only for the active channel. The header button follows the
+		// active channel for its tooltip and accessible name.
+		"clearChatButton.title = `Clear #${activeChannel} chat`",
+		"clearChatButton.setAttribute(\"aria-label\", `Clear #${activeChannel} chat`)",
+		"Clear #${name}? All messages and attachments in this channel are removed for every device.",
+		"`/api/v1/channels/${encodeURIComponent(channelID)}/messages`",
+		`Could not clear #${name}: ${error.message}`,
+		`if (channelID === activeChannel) {`,
+		`resetTimeline();`,
 		// Off-canvas drawer below 760px.
 		`function setDrawerOpen(open`,
 		`document.body.classList.toggle("drawer-open", next)`,
@@ -107,6 +123,13 @@ func TestChannelPickerListsEveryChannelAndOffersDelete(t *testing.T) {
 		`.channel-title {`,
 		`.channel-row {`,
 		`.channel-delete {`,
+		`.channel-clear {`,
+		`.channel-delete:hover, .channel-delete:focus-visible {`,
+		`.channel-clear:hover, .channel-clear:focus-visible {`,
+		`#a35b00`,
+		`.channel-clear svg {`,
+		`.channel-clear { width: var(--touch-target); height: var(--touch-target); padding: 0; justify-content: center; }`,
+		`.channel-clear span { display: none; }`,
 		`--touch-target: 44px;`,
 		// The 257px sidebar becomes a drawer instead of a 56px icon rail.
 		`@media (max-width: 760px) {`,
@@ -122,6 +145,7 @@ func TestChannelPickerListsEveryChannelAndOffersDelete(t *testing.T) {
 	}
 	for _, forbidden := range []string{
 		`.channel-item.is-unjoined`,
+		`.channel-clear-icon`,
 		`.sidebar { width: 56px;`,
 	} {
 		if strings.Contains(css, forbidden) {
