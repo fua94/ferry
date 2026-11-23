@@ -28,6 +28,7 @@ This file is Ferry's repository-level collaboration contract and the single auth
 - Before starting, read the complete current files, `git status` and the relevant history; do not judge the current state from a diff or old documents alone.
 - The repository may have concurrent sessions. Change only the files this task involves; never overwrite or commit someone else's work in progress.
 - Work in the current worktree by default. Repository changes the user has decided on are committed and pushed to `origin/main` by default; do not create branches, open PRs, deploy or publish on your own.
+- Development flow, task cards and the board mirror are defined in `docs/dev-flow.md`.
 - **Decided (Max, 2026-09-13)**: the repository is public and international, so commit messages, PR titles and PR bodies are always written in English.
 - **Decided (Max, 2026-09-13)**: every document is provided in English and Simplified Chinese. English lives at the original path and Chinese at the sibling `*.zh-Hans.md`, each linking to the other under its title. A change to either language updates the other in the same commit.
 - For a complex feature, freeze a finite, verifiable ship checklist first; when a new problem appears during implementation, decide whether it belongs to the original goal before acting, and never let an investigation replace the goal.

@@ -1,0 +1,9 @@
+{
+  "name": "ferry",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "board:sync": "node scripts/board-sync.mjs",
+    "board:sync:dry": "node scripts/board-sync.mjs --dry-run"
+  }
+}

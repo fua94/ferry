@@ -1,0 +1,33 @@
+#!/bin/sh
+# post-commit — espeja docs/tasks/*.md al tablero Vikunja después de un commit.
+#
+# Reglas:
+#   - Solo actúa si el commit tocó docs/tasks/.
+#   - VIKUNJA_SKIP=1 lo desactiva.
+#   - Un board caído NUNCA bloquea el commit: este hook siempre sale 0.
+#
+# Instalación: git config core.hooksPath .githooks
+
+set -u
+
+[ "${VIKUNJA_SKIP:-}" = "1" ] && exit 0
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$root" || exit 0
+
+changed=$(git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null) || exit 0
+case "$changed" in
+  *docs/tasks/*) ;;
+  *) exit 0 ;;
+esac
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "[board:sync] aviso: node no está disponible; se omite el espejo del board" >&2
+  exit 0
+fi
+
+if ! node scripts/board-sync.mjs; then
+  echo "[board:sync] aviso: el board no se actualizó; el commit ya está hecho" >&2
+fi
+
+exit 0
