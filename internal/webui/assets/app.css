@@ -13,6 +13,9 @@
   --faint: #999999;
   --contrast: #0a0a0a;
   --on-contrast: #ffffff;
+  /* Shared minimum for every tappable control; the responsive acceptance is
+     measured against it instead of repeating a size per selector. */
+  --touch-target: 44px;
 }
 
 * { box-sizing: border-box; }
@@ -36,22 +39,36 @@ button:focus-visible, input:focus-visible { outline: 2px solid #777; outline-off
   background: var(--base);
   border-right: 1px solid var(--border);
 }
-.sidebar-brand { height: 42px; display: flex; align-items: center; gap: 11px; padding: 0 8px; }
+/* Drawer scaffolding stays inert on wide screens; the media query below turns
+   it on when the sidebar becomes off-canvas. */
+.sidebar-toggle { position: fixed; top: 12px; left: 12px; z-index: 20; width: var(--touch-target); height: var(--touch-target); display: none; place-items: center; padding: 0; color: inherit; background: var(--raised); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 4px 16px rgba(0, 0, 0, .08); cursor: pointer; }
+.sidebar-toggle:hover { background: var(--soft); }
+.sidebar-backdrop { position: fixed; inset: 0; z-index: 30; display: none; background: rgba(0, 0, 0, .42); }
+.sidebar-close { width: var(--touch-target); height: var(--touch-target); display: none; place-items: center; flex: 0 0 auto; margin-left: auto; padding: 0; color: var(--muted); background: transparent; border: 0; border-radius: 10px; cursor: pointer; }
+.sidebar-close:hover, .sidebar-close:focus-visible { color: inherit; background: var(--hover); outline: none; }
+.sidebar-toggle svg, .sidebar-close svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.sidebar-brand { min-height: var(--touch-target); display: flex; align-items: center; gap: 11px; padding: 0 8px; }
 .sidebar-brand strong { font-size: 18px; letter-spacing: -.03em; }
 .brand-mark, .welcome-mark { display: block; object-fit: cover; }
 .brand-mark { width: 32px; height: 32px; border-radius: 10px; }
 .sidebar-nav { display: grid; gap: 4px; margin-top: 16px; }
-.sidebar-item { width: 100%; min-height: 40px; display: flex; align-items: center; gap: 11px; padding: 0 11px; color: inherit; background: transparent; border: 0; border-radius: 10px; font-size: 14px; font-weight: 550; text-align: left; }
+.sidebar-item { width: 100%; min-height: var(--touch-target); display: flex; align-items: center; gap: 11px; padding: 0 11px; color: inherit; background: transparent; border: 0; border-radius: 10px; font-size: 14px; font-weight: 550; text-align: left; }
 .sidebar-item.is-active, .sidebar-item:hover { background: var(--soft); }
 .sidebar-item svg { width: 19px; height: 19px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .sidebar-channels { min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; margin-top: 20px; }
 .sidebar-heading { margin: 0 0 6px; padding: 0 11px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 .channel-list { min-height: 0; flex: 1 1 auto; display: grid; align-content: start; gap: 1px; overflow-y: auto; }
-.channel-item { color: var(--muted); }
+.channel-row { display: flex; align-items: center; gap: 2px; min-width: 0; }
+.channel-item { min-width: 0; flex: 1 1 auto; color: var(--muted); }
 .channel-item.is-active { color: inherit; }
-.channel-item.is-unjoined { opacity: .62; }
 .channel-hash { width: 19px; flex: 0 0 auto; color: var(--muted); text-align: center; }
 .channel-item > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Every row carries its delete action so it is reachable with a finger too;
+   `default` renders it disabled because the server protects that channel. */
+.channel-delete { width: var(--touch-target); height: var(--touch-target); display: grid; place-items: center; flex: 0 0 auto; padding: 0; color: var(--muted); background: transparent; border: 0; border-radius: 10px; cursor: pointer; }
+.channel-delete:hover, .channel-delete:focus-visible { color: #c52c20; background: var(--hover); outline: 2px solid #777; outline-offset: -2px; }
+.channel-delete:disabled { color: var(--faint); background: transparent; opacity: .45; cursor: default; outline: none; }
+.channel-delete-icon { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .channel-create { margin-top: 4px; color: var(--muted); }
 .sidebar-top { min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; }
 .sidebar-server img { width: 30px; height: 30px; border-radius: 50%; }
@@ -60,7 +77,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid #777; outline-off
 .connection { display: inline-flex; align-items: center; gap: 6px; margin-top: 2px; color: var(--muted); font-size: 11px; }
 .connection::before { width: 6px; height: 6px; content: ""; border-radius: 50%; background: currentColor; }
 .secondary {
-  min-height: 38px;
+  min-height: var(--touch-target);
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -122,12 +139,11 @@ button:focus-visible, input:focus-visible { outline: 2px solid #777; outline-off
 .time::before { margin-right: 5px; content: "·"; }
 /* 10px side margin puts each 18px icon's edge on the bubble's text edge. */
 .message-actions { display: flex; gap: 2px; margin: 2px 10px 0; }
-.message-action { width: 32px; height: 32px; display: grid; place-items: center; padding: 0; color: var(--muted); background: none; border: 0; border-radius: 8px; cursor: pointer; }
+.message-action { width: var(--touch-target); height: var(--touch-target); display: grid; place-items: center; padding: 0; color: var(--muted); background: none; border: 0; border-radius: 8px; cursor: pointer; }
 .message-action:hover, .message-action:focus-visible { color: inherit; background: var(--hover); outline: none; }
 .message-action:disabled { opacity: .45; cursor: default; }
 @media (pointer: coarse) {
   .message-actions { margin: 0 6px; }
-  .message-action { width: 40px; height: 40px; }
 }
 .action-icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .message-text { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; font-size: 15px; line-height: 1.5; }
@@ -147,7 +163,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid #777; outline-off
 .message-image img { display: block; width: auto; height: auto; max-width: 320px; max-height: 360px; object-fit: contain; cursor: zoom-in; }
 .viewer { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 24px; background: rgba(0, 0, 0, .82); cursor: zoom-out; }
 .viewer img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 8px; }
-.viewer-save { position: absolute; top: 20px; right: 20px; padding: 8px 16px; color: #fff; text-decoration: none; background: rgba(255, 255, 255, .18); border-radius: 999px; font-size: 13px; font-weight: 500; cursor: pointer; }
+.viewer-save { position: absolute; top: 20px; right: 20px; min-height: var(--touch-target); display: inline-flex; align-items: center; padding: 8px 16px; color: #fff; text-decoration: none; background: rgba(255, 255, 255, .18); border-radius: 999px; font-size: 13px; font-weight: 500; cursor: pointer; }
 .viewer-save:hover, .viewer-save:focus-visible { background: rgba(255, 255, 255, .3); }
 
 .file-card { width: min(330px, 100%); display: flex; align-items: center; gap: 11px; padding: 2px 0; color: inherit; text-align: left; background: transparent; cursor: pointer; border: 0; border-radius: 12px; }
@@ -170,34 +186,41 @@ button:focus-visible, input:focus-visible { outline: 2px solid #777; outline-off
 .composer:focus-within { border-color: var(--focus-border); }
 .composer-row { display: flex; align-items: center; gap: 8px; }
 .attachment-picker { position: relative; flex: 0 0 auto; }
-.attach, .send { width: 40px; height: 40px; display: grid; place-items: center; flex: 0 0 auto; padding: 0; border: 0; border-radius: 50%; cursor: pointer; }
+.attach, .send { width: var(--touch-target); height: var(--touch-target); display: grid; place-items: center; flex: 0 0 auto; padding: 0; border: 0; border-radius: 50%; cursor: pointer; }
 .attach { background: var(--soft); }
 .attach:hover { background: var(--hover); }
 .attach[aria-expanded="true"] { transform: rotate(45deg); }
 .attach svg, .send svg { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .send { color: var(--on-contrast); background: var(--contrast); }
 .send:disabled { color: var(--faint); background: var(--soft); cursor: default; }
-textarea { min-height: 40px; max-height: 180px; width: 100%; resize: none; padding: 9px 2px 7px; color: inherit; background: transparent; border: 0; outline: 0; font-size: 15px; line-height: 1.5; }
+/* min-width: 0 lets the textarea shrink inside the flex row instead of forcing
+   the composer wider than a narrow viewport. */
+textarea { min-width: 0; min-height: 40px; max-height: 180px; width: 100%; flex: 1 1 auto; resize: none; padding: 9px 2px 7px; color: inherit; background: transparent; border: 0; outline: 0; font-size: 15px; line-height: 1.5; }
 textarea:focus-visible { outline: none; }
 textarea::placeholder { color: var(--faint); }
 textarea:disabled { color: var(--faint); }
-.file-chip { position: relative; width: fit-content; max-width: calc(100% - 8px); height: 40px; margin: 3px 4px 8px; padding: 0 6px 0 10px; display: flex; align-items: center; gap: 8px; color: inherit; background: var(--soft); border: 1px solid var(--border); border-radius: 12px; font-size: 13px; }
+.file-chip { position: relative; width: fit-content; max-width: calc(100% - 8px); min-height: var(--touch-target); margin: 3px 4px 8px; padding: 0 6px 0 10px; display: flex; align-items: center; gap: 8px; color: inherit; background: var(--soft); border: 1px solid var(--border); border-radius: 12px; font-size: 13px; }
 .file-kind-icon { width: 20px; height: 24px; display: grid; place-items: center; flex: 0 0 auto; color: var(--muted); }
 .file-kind-icon svg, .file-chip button svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .file-chip #file-name { max-width: min(250px, calc(100vw - 190px)); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.file-chip button { width: 24px; height: 24px; padding: 4px; display: grid; place-items: center; flex: 0 0 auto; color: var(--muted); background: transparent; border: 0; border-radius: 50%; cursor: pointer; }
+.file-chip button { width: var(--touch-target); height: var(--touch-target); padding: 0; display: grid; place-items: center; flex: 0 0 auto; color: var(--muted); background: transparent; border: 0; border-radius: 50%; cursor: pointer; }
 .file-chip button:hover, .file-chip button:focus-visible { color: inherit; background: var(--hover); outline: none; }
 .file-preview { display: none; width: auto; height: auto; max-width: 220px; max-height: 96px; object-fit: contain; border-radius: 10px; }
-.file-chip.is-image { width: fit-content; height: auto; min-height: 40px; padding: 3px; gap: 0; }
+.file-chip.is-image { width: fit-content; height: auto; min-height: var(--touch-target); padding: 3px; gap: 0; }
 .file-chip.is-image .file-kind-icon, .file-chip.is-image #file-name { display: none; }
 .file-chip.is-image .file-preview { display: block; }
 .file-chip.is-image button { position: absolute; top: -7px; right: -7px; color: inherit; background: var(--raised); border: 1px solid var(--border); opacity: 1; transform: scale(.8); transition: transform .12s ease; }
 .file-chip.is-image:hover button, .file-chip.is-image:focus-within button { transform: scale(1); }
+/* The decorative shrink would leave a 35px hit area; a finger keeps the full
+   44px target. */
+@media (pointer: coarse) {
+  .file-chip.is-image button { transform: none; }
+}
 .footnote { min-height: 15px; margin: 7px auto 0; color: var(--faint); text-align: center; font-size: 11px; }
 .footnote.error { color: #c52c20; }
 
 .attachment-menu { position: absolute; z-index: 20; bottom: calc(100% + 12px); left: 0; width: 248px; padding: 7px; color: inherit; background: var(--raised); background: color-mix(in srgb, var(--raised) 92%, transparent); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 16px 48px rgba(0, 0, 0, .15); backdrop-filter: blur(22px); }
-.attachment-menu > button { width: 100%; display: flex; align-items: center; gap: 11px; padding: 10px; color: inherit; text-align: left; background: transparent; border: 0; border-radius: 12px; cursor: pointer; }
+.attachment-menu > button { width: 100%; min-height: var(--touch-target); display: flex; align-items: center; gap: 11px; padding: 10px; color: inherit; text-align: left; background: transparent; border: 0; border-radius: 12px; cursor: pointer; }
 .attachment-menu > button:hover, .attachment-menu > button:focus-visible { background: var(--soft); outline: none; }
 .attachment-menu-icon { width: 36px; height: 36px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 11px; color: inherit; background: var(--soft); }
 .attachment-menu-icon svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
@@ -219,7 +242,7 @@ textarea:disabled { color: var(--faint); }
 .connect-copy h2 { font-size: 17px; letter-spacing: -.02em; }
 .connect-copy p { color: var(--muted); font-size: 13px; line-height: 1.45; }
 .connect-address { min-width: 0; display: flex; gap: 8px; }
-.connect-address input { min-width: 0; min-height: 40px; flex: 1 1 auto; padding: 0 14px; color: inherit; background: var(--raised); border: 1px solid var(--border); border-radius: 20px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; }
+.connect-address input { min-width: 0; min-height: var(--touch-target); flex: 1 1 auto; padding: 0 14px; color: inherit; background: var(--raised); border: 1px solid var(--border); border-radius: 20px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; }
 .connect-note:empty { display: none; }
 .connect-copy .connect-note.error { color: #c52c20; }
 /* The code keeps its own white ground and quiet zone in dark mode; scanners
@@ -233,7 +256,7 @@ textarea:disabled { color: var(--faint); }
 .device-list-icon { width: 36px; height: 36px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 11px; color: inherit; background: var(--soft); }
 .device-name { font-weight: 600; }
 .device-meta { margin-top: 2px; color: var(--muted); font-size: 12px; }
-.revoke { padding: 7px 10px; color: #c52c20; background: transparent; border: 1px solid #dcaaa6; border-color: color-mix(in srgb, #c52c20 35%, var(--border)); border-radius: 999px; cursor: pointer; }
+.revoke { min-height: var(--touch-target); padding: 7px 12px; color: #c52c20; background: transparent; border: 1px solid #dcaaa6; border-color: color-mix(in srgb, #c52c20 35%, var(--border)); border-radius: 999px; cursor: pointer; }
 .access-settings { display: grid; gap: 14px; margin-top: 36px; padding: 22px; background: var(--soft); border: 1px solid var(--border); border-radius: 22px; }
 .access-settings h2, .access-settings p { margin: 0; }
 .access-settings p, .access-settings output { color: var(--muted); font-size: 13px; line-height: 1.4; }
@@ -266,28 +289,44 @@ textarea:disabled { color: var(--faint); }
   .form-error, .footnote.error, .connect-copy .connect-note.error { color: #ff7167 !important; }
 }
 
+/* Below 760px a fixed 257px sidebar would leave too little room for the
+   timeline, so it becomes an off-canvas drawer: the toggle in the corner opens
+   the full channel list (names intact) and the content keeps the whole width.
+   The compact 56px icon rail was dropped because it hid the channel names. */
+@media (max-width: 760px) {
+  body.drawer-open { overflow: hidden; }
+  .sidebar { z-index: 40; width: min(300px, 86vw); transform: translateX(-100%); transition: transform 180ms ease; }
+  .drawer-open .sidebar { transform: translateX(0); }
+  .sidebar-toggle:not([hidden]) { display: grid; }
+  .sidebar-close { display: grid; }
+  .sidebar-backdrop:not([hidden]) { display: block; }
+  .conversation, .devices-page { width: 100%; margin-left: 0; }
+  .conversation { padding: 76px 16px 132px; }
+  .devices-page { padding: 76px 16px 64px; }
+  .composer-shell { left: 0; }
+  .welcome { inset: calc(50% - 265px) 0 auto 0; }
+}
+
+/* The empty-timeline composer sits under the welcome block on wide screens;
+   between 641 and 760px it follows the drawer instead of the removed rail. */
+@media (min-width: 641px) and (max-width: 760px) {
+  .welcome:not([hidden]) ~ .composer-shell { inset: calc(50% - 101px) 0 auto 0; background: transparent; }
+}
+
 @media (max-width: 640px) {
-  .sidebar { width: 56px; padding: 10px 7px; }
-  .sidebar-brand { padding: 0 5px; }
-  .sidebar-brand strong, .sidebar-item span, .sidebar-server div { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
-  .sidebar-item { justify-content: center; padding: 0; }
-  .sidebar-server { justify-content: center; padding: 8px 0; }
-  .conversation { width: calc(100% - 56px); margin-left: 56px; padding: 72px 12px 132px; }
-  .devices-page { width: calc(100% - 56px); margin-left: 56px; padding: 40px 16px 64px; }
   .devices-head { margin-bottom: 28px; }
   .devices-head h1 { font-size: 30px; }
   .access-settings { margin-top: 28px; padding: 18px; }
   .connect-device { grid-template-columns: minmax(0, 1fr); margin-bottom: 28px; padding: 18px; }
   .connect-qr { justify-self: center; width: min(220px, 100%); }
   .access-settings .secondary { justify-self: stretch; }
-  .welcome { inset: calc(50% - 170px) 0 auto 56px; }
+  .welcome { inset: calc(50% - 170px) 0 auto 0; }
   .welcome-mark { width: 44px; height: 44px; border-radius: 14px; }
   .welcome h1 { font-size: 32px; }
   .messages { gap: 24px; }
   .message-body { max-width: 94%; }
-  .composer-shell { left: 56px; padding: 9px 8px calc(9px + env(safe-area-inset-bottom)); }
+  .composer-shell { padding: 9px 8px calc(9px + env(safe-area-inset-bottom)); }
   .composer { padding: 8px; }
-  .attach, .send { width: 42px; height: 42px; }
   textarea { min-height: 42px; padding-top: 10px; }
   .footnote { margin-top: 5px; }
 }
@@ -298,7 +337,7 @@ textarea:disabled { color: var(--faint); }
 
 /* Channel picker: one row above the timeline, same width as the messages. */
 .channel-bar { width: min(704px, 100%); margin: 0 auto 18px; display: flex; align-items: center; gap: 8px; }
-.channel-title { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: -.02em; }
+.channel-title { min-width: 0; margin: 0; overflow: hidden; font-size: 17px; font-weight: 650; letter-spacing: -.02em; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 760px) {
   .channel-bar { padding: 0 2px; }
 }

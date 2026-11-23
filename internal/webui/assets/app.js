@@ -44,6 +44,9 @@ const connectQR = document.querySelector("#connect-qr");
 const channelList = document.querySelector("#channel-list");
 const channelTitle = document.querySelector("#channel-title");
 const newChannelButton = document.querySelector("#new-channel");
+const sidebarToggle = document.querySelector("#sidebar-toggle");
+const sidebarClose = document.querySelector("#sidebar-close");
+const sidebarBackdrop = document.querySelector("#sidebar-backdrop");
 
 const messageImages = new Map();
 const pendingImages = new WeakMap();
@@ -90,10 +93,12 @@ const DEVICE_ICON_PATHS = Object.freeze({
 });
 
 // Tabler icons, like the device icons above.
+const TRASH_ICON_PATHS = Object.freeze(["M4 7h16", "M10 11v6", "M14 11v6", "M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12", "M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3"]);
 const ACTION_ICON_PATHS = Object.freeze({
   copy: ["M7 9.667A2.667 2.667 0 0 1 9.667 7h8.666A2.667 2.667 0 0 1 21 9.667v8.666A2.667 2.667 0 0 1 18.333 21H9.667A2.667 2.667 0 0 1 7 18.333z", "M4.012 16.737A2.005 2.005 0 0 1 3 15V5c0-1.1.9-2 2-2h10c.75 0 1.158.385 1.5 1"],
   copied: ["M5 12l5 5L20 7"],
-  recall: ["M4 7h16", "M10 11v6", "M14 11v6", "M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12", "M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3"],
+  recall: TRASH_ICON_PATHS,
+  trash: TRASH_ICON_PATHS,
 });
 
 const localDeviceKind = defaultDeviceKind();
@@ -160,9 +165,9 @@ function storeToken(token) {
   }
 }
 
-// Channels are per device: the server only lists the ones this device joined,
-// so a stale stored id falls back to default (or to the first available one
-// when the device never joined default).
+// Channels are visibility rather than permission: every device sees every
+// channel, so the stored preference only remembers which one is on screen. A
+// stale id falls back to default (or to the first channel that exists).
 function readStoredChannel() {
   try {
     return localStorage.getItem("ferry_channel") || "default";
@@ -255,6 +260,8 @@ function showAccess(message = "", clearCredential = true, passwordRequired = fal
   }
   accessElement.hidden = false;
   sidebar.hidden = true;
+  sidebarToggle.hidden = true;
+  closeDrawer();
   passwordField.hidden = !passwordRequired;
   // Behind a deployer's TLS proxy the page itself is HTTPS, and the warning
   // would be false.
@@ -270,6 +277,7 @@ function showAccess(message = "", clearCredential = true, passwordRequired = fal
 
 function selectView(view) {
   activeView = view;
+  closeDrawer();
   const connected = Boolean(currentDevice);
   const timelineActive = connected && view === "timeline";
   const devicesActive = connected && view === "devices";
@@ -293,6 +301,7 @@ function showApp(device) {
   connectionError = "";
   accessElement.hidden = true;
   sidebar.hidden = false;
+  sidebarToggle.hidden = false;
   deviceButton.hidden = false;
   currentDeviceElement.textContent = `Current device: ${device.name}`;
   connectionElement.textContent = "Local";
@@ -690,28 +699,36 @@ async function loadChannels() {
   if (!response.ok) throw new Error(await readError(response));
   const payload = await response.json();
   if (generation !== authGeneration) return;
-  renderChannelList(payload.channels || []);
+  // The returned flag tells the caller whether the channel on screen vanished
+  // with this list (the picker then falls back to default or the first channel).
+  return renderChannelList(payload.channels || []);
 }
 
 let knownChannels = [];
 
-// Slack-style picker: every channel on the server is listed. Joined channels
-// open on click, the rest join first, which is why the list carries `joined`.
+// The picker lists every channel on the server. Channels are visibility, not
+// permission, so nothing is dimmed for lack of membership and clicking a row
+// only switches the timeline. Each row carries its own delete action, except
+// `default`, which the server protects.
 function renderChannelList(channels) {
   knownChannels = channels;
-  const joined = channels.filter((channel) => channel.joined).map((channel) => channel.id);
-  if (!joined.includes(activeChannel)) {
-    activeChannel = joined.includes("default") ? "default" : (joined[0] || "default");
+  const ids = channels.map((channel) => channel.id);
+  let activeChanged = false;
+  if (!ids.includes(activeChannel)) {
+    activeChannel = ids.includes("default") ? "default" : (ids[0] || "default");
     storeChannel(activeChannel);
+    activeChanged = true;
   }
   channelList.replaceChildren();
   for (const channel of channels) {
+    const row = document.createElement("div");
+    row.className = "channel-row";
+    row.setAttribute("role", "listitem");
     const button = document.createElement("button");
     button.type = "button";
     button.className = "sidebar-item channel-item";
     button.classList.toggle("is-active", channel.id === activeChannel);
-    button.classList.toggle("is-unjoined", !channel.joined);
-    button.title = channel.joined ? `Open #${channel.name}` : `Join #${channel.name}`;
+    button.title = `Open #${channel.name}`;
     button.setAttribute("aria-current", channel.id === activeChannel ? "page" : "false");
     button.dataset.channel = channel.id;
     const hash = document.createElement("span");
@@ -721,11 +738,31 @@ function renderChannelList(channels) {
     label.textContent = channel.name;
     button.append(hash, label);
     button.addEventListener("click", () => openChannel(channel.id));
-    channelList.append(button);
+    row.append(button, channelDeleteButton(channel));
+    channelList.append(row);
   }
   channelTitle.textContent = `#${activeChannel}`;
   // The connect address and QR embed the active channel, so they follow a switch.
   renderConnectSection();
+  return activeChanged;
+}
+
+function channelDeleteButton(channel) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "channel-delete";
+  button.dataset.channel = channel.id;
+  button.append(createIcon(ACTION_ICON_PATHS.trash, "channel-delete-icon"));
+  if (channel.id === "default") {
+    // The server answers 409 channel_protected for this one; do not offer an
+    // action that can never succeed.
+    button.disabled = true;
+    setActionLabel(button, "The default channel cannot be deleted");
+  } else {
+    setActionLabel(button, `Delete #${channel.name}`);
+    button.addEventListener("click", () => deleteChannel(channel.id));
+  }
+  return button;
 }
 
 // Keeps the sidebar highlight in step with the timeline after a switch, without
@@ -739,27 +776,10 @@ function markActiveChannel() {
   }
 }
 
-// A channel that this device has not joined yet is joined on first click, so
-// the picker behaves like Slack's channel list instead of asking for a token.
+// Clicking a channel only switches the timeline; the deprecated join endpoint
+// is never called, because every channel is already readable.
 async function openChannel(channelID) {
-  if (channelID === activeChannel) return;
-  const channel = knownChannels.find((entry) => entry.id === channelID);
-  if (channel && !channel.joined) {
-    const generation = authGeneration;
-    const response = await authenticatedFetch("/api/v1/channels/join", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ channel: channelID }),
-      signal: authController.signal,
-    });
-    if (generation !== authGeneration) return;
-    if (!response.ok) {
-      sendError = `Could not join #${channelID}`;
-      renderStatus();
-      return;
-    }
-    await loadChannels();
-  }
+  closeDrawer();
   await switchChannel(channelID);
 }
 
@@ -806,10 +826,72 @@ async function createChannel() {
     if (!response.ok) throw new Error(await readError(response));
     await loadChannels();
     await switchChannel(channelID);
+    closeDrawer();
   } catch (error) {
     if (generation !== authGeneration || error.name === "AbortError") return;
     sendError = `Could not create channel: ${error.message}`;
     renderStatus();
+  }
+}
+
+// Deleting removes the channel and everything in it for every device. The
+// confirmation names the channel, `default` is refused before the request, and
+// the two answers the server may give (409 channel_protected, 404 not_found)
+// leave the page usable instead of showing a broken list.
+async function deleteChannel(channelID) {
+  if (channelID === "default") return;
+  const channel = knownChannels.find((entry) => entry.id === channelID);
+  const name = channel ? channel.name : channelID;
+  if (!window.confirm(`Delete #${name}? Its messages and attachments are removed for every device.`)) return;
+  sendError = "";
+  const generation = authGeneration;
+  try {
+    const response = await authenticatedFetch(`/api/v1/channels/${encodeURIComponent(channelID)}`, {
+      method: "DELETE",
+      signal: authController.signal,
+    });
+    if (generation !== authGeneration) return;
+    if (response.status === 401) {
+      showAccess("This device is no longer connected.");
+      return;
+    }
+    if (response.status === 409) {
+      sendError = "The default channel cannot be deleted.";
+      renderStatus();
+      return;
+    }
+    if (response.status === 404) {
+      // Another device removed it first; reconcile the picker and the timeline.
+      await forgetChannel(channelID);
+      if (!sendError) sendError = `#${name} no longer exists. The channel list was refreshed.`;
+      renderStatus();
+      return;
+    }
+    if (!response.ok) throw new Error(await readError(response));
+    await forgetChannel(channelID);
+    renderStatus();
+  } catch (error) {
+    if (generation !== authGeneration || error.name === "AbortError") return;
+    sendError = `Could not delete #${name}: ${error.message}`;
+    renderStatus();
+  }
+}
+
+// Drops a channel the server no longer has. When it was the one on screen the
+// timeline returns to `default`, so a deleted channel never keeps rendering. A
+// failed refresh is reported without undoing or hiding the delete that worked.
+async function forgetChannel(channelID) {
+  try {
+    if (channelID === activeChannel) await switchChannel("default");
+    if (await loadChannels()) {
+      // A refresh can also drop the channel that was on screen (deleted from
+      // another device), so the timeline follows the fallback too.
+      resetTimeline();
+      await loadMessages();
+    }
+  } catch (error) {
+    if (error.name === "AbortError") throw error;
+    sendError = `The channel was removed, but the list could not be refreshed: ${error.message}`;
   }
 }
 
@@ -1258,9 +1340,12 @@ document.addEventListener("click", (event) => {
   if (!attachmentMenu.hidden && !attachmentPicker.contains(event.target)) setAttachmentMenuOpen(false);
 });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !attachmentMenu.hidden) {
+  if (event.key !== "Escape") return;
+  if (!attachmentMenu.hidden) {
     setAttachmentMenuOpen(false);
     attachButton.focus();
+  } else if (drawerOpen()) {
+    setDrawerOpen(false, { restoreFocus: true });
   }
 });
 removeFileButton.addEventListener("click", () => {
@@ -1273,7 +1358,46 @@ filePreview.addEventListener("error", () => {
   previewFailed = true;
   updateComposer();
 });
+
+// Below 760px a fixed 257px sidebar would take most of the viewport, so it
+// becomes an off-canvas drawer instead of shrinking to an icon rail: full
+// channel names stay readable, the timeline keeps the whole width and a
+// visible toggle opens the same list.
+const DRAWER_QUERY = "(max-width: 760px)";
+
+function drawerApplies() {
+  return window.matchMedia(DRAWER_QUERY).matches;
+}
+
+function drawerOpen() {
+  return document.body.classList.contains("drawer-open");
+}
+
+function setDrawerOpen(open, { restoreFocus = false } = {}) {
+  const next = Boolean(open) && drawerApplies();
+  document.body.classList.toggle("drawer-open", next);
+  sidebarToggle.setAttribute("aria-expanded", String(next));
+  sidebarBackdrop.hidden = !next;
+  if (next) {
+    (channelList.querySelector(".channel-item.is-active") || sidebarClose).focus();
+  } else if (restoreFocus) {
+    sidebarToggle.focus();
+  }
+}
+
+function closeDrawer(options) {
+  setDrawerOpen(false, options);
+}
+
+sidebarToggle.addEventListener("click", () => setDrawerOpen(!drawerOpen()));
+sidebarClose.addEventListener("click", () => setDrawerOpen(false, { restoreFocus: true }));
+sidebarBackdrop.addEventListener("click", () => setDrawerOpen(false, { restoreFocus: true }));
 window.addEventListener("resize", resizeComposer);
+window.addEventListener("resize", () => {
+  // Leaving the drawer width closes it, so a resized window never keeps a
+  // stale overlay or an open-but-hidden state.
+  if (!drawerApplies() && drawerOpen()) setDrawerOpen(false);
+});
 
 updateComposer();
 resizeComposer();

@@ -170,7 +170,7 @@ func TestDevicesSidebarItemNavigatesMainContentInsteadOfOpeningDialog(t *testing
 	stylesheet := httptest.NewRecorder()
 	handler.ServeHTTP(stylesheet, httptest.NewRequest(http.MethodGet, "/app.css", nil))
 	css := stylesheet.Body.String()
-	for _, contract := range []string{`.devices-page { width: calc(100% - 257px);`, `.devices-content { width: min(760px, 100%);`, `.devices-page { width: calc(100% - 56px);`} {
+	for _, contract := range []string{`.devices-page { width: calc(100% - 257px);`, `.devices-content { width: min(760px, 100%);`, `.conversation, .devices-page { width: 100%; margin-left: 0; }`} {
 		if !strings.Contains(css, contract) {
 			t.Errorf("stylesheet does not contain Devices page contract %q", contract)
 		}
@@ -289,7 +289,7 @@ func TestComposerUsesReadableImagePreviewAndCompactFileChip(t *testing.T) {
 
 	stylesheet := httptest.NewRecorder()
 	handler.ServeHTTP(stylesheet, httptest.NewRequest(http.MethodGet, "/app.css", nil))
-	for _, contract := range []string{`.composer.has-attachment { border-radius: 32px; }`, `.file-chip { position: relative; width: fit-content;`, `.file-preview { display: none; width: auto; height: auto; max-width: 220px; max-height: 96px; object-fit: contain;`, `.file-chip.is-image { width: fit-content; height: auto; min-height: 40px; padding: 3px;`, `.file-chip.is-image:hover button`} {
+	for _, contract := range []string{`.composer.has-attachment { border-radius: 32px; }`, `.file-chip { position: relative; width: fit-content;`, `.file-preview { display: none; width: auto; height: auto; max-width: 220px; max-height: 96px; object-fit: contain;`, `.file-chip.is-image { width: fit-content; height: auto; min-height: var(--touch-target); padding: 3px;`, `.file-chip.is-image:hover button`} {
 		if !strings.Contains(stylesheet.Body.String(), contract) {
 			t.Errorf("stylesheet does not contain attachment-chip contract %q", contract)
 		}
