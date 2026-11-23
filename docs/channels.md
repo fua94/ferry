@@ -1,69 +1,78 @@
-# Channels: opt-in separate timelines
+# Canales: líneas de tiempo separadas y visibilidad compartida
 
-This document is the pull request description for the `feature/channels` branch,
-kept in the repository so the rationale is versioned next to the code.
+Este documento describe el contrato de canales de Ferry y se mantiene versionado junto al código.
 
-Ferry is one shared timeline; that is a large part of why it is this small. A
-deployment with a phone, a laptop and a tablet may still need work links
-separated from personal ones without running one server per timeline.
+Ferry es una línea de tiempo compartida; eso explica buena parte de su tamaño. Una instalación con
+un teléfono, un portátil y una tableta puede necesitar separar el trabajo de lo personal sin
+ejecutar un servidor por cada línea de tiempo.
 
-Channels are **opt-in and additive**.
+Los canales son **opt-in y aditivos**.
 
-## Behaviour
+## Comportamiento
 
-- A request that does not mention a channel behaves exactly as before: it reads
-  and writes `default`. The native iOS and Android apps keep working untouched
-  and simply see `default`.
-- `channels` and `device_channels` tables; `messages.channel_id` and
-  `retractions.channel_id` are added through the existing `ALTER TABLE`
-  migration path with `DEFAULT 'default'`, so a v1.0.5 database opens unchanged
-  and every existing device becomes a member of `default`.
-- `POST /api/v1/channels` creates a channel (slug, 1–32 characters, lowercase
-  letters, digits and inner hyphens) and joins its creator. An existing slug is
-  `409 channel_exists`; an invalid slug is `400`.
-- `POST /api/v1/channels/join` adds a device that already holds a token to a
-  channel that already exists (`204`, idempotent). Without it, a device could
-  only ever see the channels it was created in.
-- `GET /api/v1/channels` returns every channel on the server with a `joined`
-  flag for the requesting device, because the picker is a sidebar list.
-- `GET /api/v1/messages`, `POST /api/v1/messages/text`,
-  `POST /api/v1/messages/file`, `GET /api/v1/devices`, `GET /api/v1/files/{id}`
-  and `POST /api/v1/files/{id}/link` accept an optional `channel` query
-  parameter. `DELETE /api/v1/messages/{id}` resolves the channel from the
-  message itself.
-- A channel the device is not a member of answers `404`, the same as a channel
-  that does not exist, so the API never confirms what exists. `join` is the only
-  way to tell, and that is deliberate: it matches the "trusted LAN, no accounts"
-  model.
-- Any member of a channel can recall any message in it. That keeps Ferry's
-  existing no-owner model instead of introducing roles.
-- The access password stays server-wide. Per-channel passwords would be a
-  permission system, which Ferry deliberately does not have.
+- Una petición que no menciona un canal se comporta exactamente como antes: lee y escribe
+  `default`. Las apps nativas de iOS y Android siguen funcionando sin cambios y solo ven `default`.
+- Las tablas `channels` y `device_channels` existen; `messages.channel_id` y
+  `retractions.channel_id` se añaden mediante el camino de migración `ALTER TABLE` con
+  `DEFAULT 'default'`, de modo que una base v1.0.5 abre sin cambios y cada dispositivo existente
+  conserva una fila histórica en `default`.
+- **Un canal es visibilidad, no permiso.** Cualquier dispositivo autenticado ve, lee y escribe en
+  todos los canales. No hay membresía, propietario, rol ni invitación que limite una lectura o una
+  escritura.
+- `device_channels` permanece en el esquema y en los datos por compatibilidad de migración, pero
+  ninguna lectura ni escritura la consulta. No se borran filas ni columnas al migrar; las filas
+  heredadas solo se eliminan cuando se borra su canal.
+- `GET /api/v1/channels` devuelve todos los canales del servidor. El campo `joined` se conserva
+  siempre en `true` para no romper a clientes antiguos; ya no significa membresía, la web no lo lee
+  y puede retirarse en un cambio posterior.
+- `POST /api/v1/channels` crea un canal. El cuerpo usa el campo `name`, no `slug`: el valor tiene
+  forma de slug (1–32 caracteres, minúsculas, dígitos y guiones internos), pero el campo se llama
+  `name`. Un nombre existente responde `409 channel_exists`; uno inválido responde `400`.
+- `POST /api/v1/channels/join` es un no-op idempotente conservado por compatibilidad de API:
+  responde `204` si el canal existe y `404` si no existe, y no escribe en `device_channels`. Ya no
+  es necesario para ver ni para escribir en un canal.
+- La regla de `404` anti-fingerprint para «canales ajenos» desaparece: ya no existen canales
+  ajenos. Un canal que no existe sigue siendo `404 not_found`.
+- `DELETE /api/v1/channels/{channel_id}` borra el canal y, dentro de una transacción, sus mensajes,
+  sus retractions, sus filas de `device_channels` y el propio canal. Los blobs de los archivos se
+  eliminan del disco después del commit; los enlaces de descarga emitidos para ellos dejan de
+  resolver. Cualquier dispositivo autenticado puede borrar: el modelo no tiene dueño ni roles.
+  - `default` está protegido y responde `409 channel_protected`.
+  - Un canal inexistente responde `404 not_found`.
+  - Un segundo `DELETE` del mismo id responde `404 not_found`, igual que el resto de borrados de
+    la API; no hay idempotencia con `204`.
+  - Un id con formato inválido responde `400 invalid_request`.
+- Cualquier dispositivo autenticado puede retractar cualquier mensaje de cualquier canal. Se
+  mantiene el modelo sin dueño en lugar de introducir roles.
+- La contraseña de acceso sigue siendo del servidor completo. Las contraseñas por canal serían un
+  sistema de permisos, que Ferry deliberadamente no tiene.
 
 ## Web app
 
-- The channel picker is a list in the sidebar, not a dropdown: every channel,
-  the active one highlighted, the ones not joined dimmed.
-- Clicking a channel that is not joined joins it and opens it.
-- The connect address and QR code carry the active channel, so a device that
-  scans it lands in the timeline it was invited to instead of `default`.
+- La lista de canales del sidebar muestra todos los canales; ninguno queda atenuado por falta de
+  membresía. El clic en un canal solo cambia de línea de tiempo: la web no llama a
+  `POST /api/v1/channels/join` ni lee el campo `joined`.
+- Cada fila ofrece una acción de borrado con confirmación. `default` la muestra deshabilitada
+  porque el servidor responde `409 channel_protected`; un `404` significa que el canal ya no
+  existía y la lista se refresca. Si se borra el canal activo, la vista vuelve a `default`.
+- La dirección de conexión y el código QR siguen llevando el canal activo, de modo que un
+  dispositivo que los escanee abre la línea de tiempo elegida en lugar de `default`.
+- Por debajo de 760 px el sidebar se convierte en un drawer off-canvas con un botón de apertura
+  visible, en lugar de comerse el contenido o reducirse a una barra de iconos. Los controles
+  táctiles usan un mínimo compartido de 44 px y no hay scroll horizontal a 390, 768 ni 1280 px.
+  La aceptación de esa medida se comprueba en un navegador durante la fase de verificación visual.
 
-## Tests and verification
+## Tests y verificación
 
-- `go build ./...`, `go vet ./...`, `go test -race -count=1 ./...` all pass. New
-  tests cover the migration from a v1.0.5 schema, channel isolation, membership
-  enforcement, the join endpoint, and the compatibility path with no `channel`
-  parameter.
-- Beyond the Go tests, the built image was exercised over HTTP: two channels,
-  text messages and a file upload, cross-channel `404`s for reads, writes,
-  recalls and downloads, per-channel device lists, and a fresh browser joining
-  through a `?channel=` link.
-- Image size is unchanged at 19.2/19.3 MB.
+- `go build ./...`, `go vet ./...` y `go test -race -count=1 ./...` pasan.
+- Las pruebas cubren la migración desde un esquema v1.0.5, la lectura y escritura de todos los
+  canales por un dispositivo sin membresía, el `join` repetido sin filas nuevas, el borrado en
+  cascada de mensajes, retractions, membresías y blobs, `default` protegido, el `404` de un canal
+  inexistente y el segundo borrado.
 
 ## Scope note
 
-`docs/product-core.md` lists "group management" as out of scope. Channels are
-smaller than that: no accounts, no invitations, no roles, no presence, no
-admin. A channel is *visibility*, not permission. A deployment that prefers one
-timeline can ignore the feature entirely, because the default path is byte for
-byte the old behaviour.
+`docs/product-core.md` incluye la «gestión de grupos» fuera de alcance. Los canales son algo más
+pequeño: sin cuentas, sin invitaciones, sin roles, sin presencia y sin administración. Un canal es
+*visibilidad*, no permiso. Una instalación que prefiera una sola línea de tiempo puede ignorar la
+función por completo, porque el camino por defecto conserva el comportamiento anterior.
