@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -421,18 +422,14 @@ func (s *Store) AuthenticateDevice(ctx context.Context, tokenHash [32]byte) (Dev
 	return device, err
 }
 
-func (s *Store) ListDevices(ctx context.Context, channelID string) ([]Device, error) {
-	channelID, err := normalizeChannelID(channelID)
-	if err != nil {
-		return nil, err
-	}
+// ListDevices returns every connected device. Channels are visibility, not
+// permission, so a channel never scopes which devices are listed.
+func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
 	rows, err := s.db.QueryContext(ctx, `
-        SELECT devices.id, devices.name, devices.kind, devices.created_at
+        SELECT id, name, kind, created_at
         FROM devices
-        JOIN device_channels ON device_channels.device_id = devices.id
-        WHERE device_channels.channel_id = ?
-        ORDER BY devices.created_at, devices.id
-    `, channelID)
+        ORDER BY created_at, id
+    `)
 	if err != nil {
 		return nil, fmt.Errorf("query devices: %w", err)
 	}
@@ -451,13 +448,9 @@ func (s *Store) ListDevices(ctx context.Context, channelID string) ([]Device, er
 	return devices, nil
 }
 
-// DeleteDevice revokes a device only through a channel both devices share, so
-// a device cannot learn about or touch one that lives elsewhere.
-func (s *Store) DeleteDevice(ctx context.Context, requesterID, channelID, id string) error {
-	channelID, err := normalizeChannelID(channelID)
-	if err != nil {
-		return err
-	}
+// DeleteDevice revokes another connected device. Channels are visibility, not
+// permission, so no channel scopes which device can be revoked.
+func (s *Store) DeleteDevice(ctx context.Context, requesterID, id string) error {
 	if !validID(requesterID) || !validID(id) {
 		return ErrNotFound
 	}
@@ -468,17 +461,9 @@ func (s *Store) DeleteDevice(ctx context.Context, requesterID, channelID, id str
 	defer transaction.Rollback()
 	var requesterLive, targetLive bool
 	if err := transaction.QueryRowContext(ctx, `
-        SELECT EXISTS(
-                   SELECT 1 FROM devices
-                   JOIN device_channels ON device_channels.device_id = devices.id
-                   WHERE devices.id = ? AND device_channels.channel_id = ?
-               ),
-               EXISTS(
-                   SELECT 1 FROM devices
-                   JOIN device_channels ON device_channels.device_id = devices.id
-                   WHERE devices.id = ? AND device_channels.channel_id = ?
-               )
-    `, requesterID, channelID, id, channelID).Scan(&requesterLive, &targetLive); err != nil {
+        SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?),
+               EXISTS(SELECT 1 FROM devices WHERE id = ?)
+    `, requesterID, id).Scan(&requesterLive, &targetLive); err != nil {
 		return fmt.Errorf("check device delete: %w", err)
 	}
 	if !requesterLive {
@@ -532,7 +517,7 @@ func (s *Store) CreateChannel(ctx context.Context, id string) (Channel, error) {
 	if inserted != 1 {
 		return Channel{}, ErrConflict
 	}
-	return Channel{ID: id, Name: id, CreatedAt: createdAt}, nil
+	return Channel{ID: id, Name: id, CreatedAt: createdAt, Joined: true}, nil
 }
 
 func (s *Store) ChannelExists(ctx context.Context, id string) (bool, error) {
@@ -546,24 +531,15 @@ func (s *Store) ChannelExists(ctx context.Context, id string) (bool, error) {
 	return exists == 1, nil
 }
 
-// ListChannels returns every channel on this server with a flag saying whether
-// the asking device is a member. Channel names are not secret on a trusted LAN
-// and a Slack-style picker has to show them, but reading a timeline still needs
-// membership, so `joined` decides whether the client opens or joins first.
-func (s *Store) ListChannels(ctx context.Context, deviceID string) ([]Channel, error) {
-	if !validID(deviceID) {
-		return nil, ErrUnauthorized
-	}
+// ListChannels returns every channel on this server. Visibility is not
+// membership: every authenticated device can read and write every timeline, so
+// the channel list no longer depends on which device is asking.
+func (s *Store) ListChannels(ctx context.Context) ([]Channel, error) {
 	rows, err := s.db.QueryContext(ctx, `
-        SELECT channels.id, channels.name, channels.created_at,
-               EXISTS(
-                   SELECT 1 FROM device_channels
-                   WHERE device_channels.channel_id = channels.id
-                     AND device_channels.device_id = ?
-               )
+        SELECT id, name, created_at
         FROM channels
-        ORDER BY channels.created_at, channels.id
-    `, deviceID)
+        ORDER BY created_at, id
+    `)
 	if err != nil {
 		return nil, fmt.Errorf("query channels: %w", err)
 	}
@@ -582,56 +558,73 @@ func (s *Store) ListChannels(ctx context.Context, deviceID string) ([]Channel, e
 	return channels, nil
 }
 
-func (s *Store) JoinChannel(ctx context.Context, deviceID, channelID string) error {
-	if !validID(deviceID) {
-		return ErrUnauthorized
-	}
-	channelID, err := normalizeChannelID(channelID)
+// DeleteChannel removes one channel and everything that belongs to it in a
+// single transaction: retractions, messages, membership rows kept for legacy
+// data, and the channel itself. File blobs are unlinked after the commit, so a
+// failed unlink can only leave an orphan file, never a database row that points
+// at missing bytes. The default channel is ErrProtected; deleting an unknown
+// channel is ErrNotFound, including a second delete of the same id.
+func (s *Store) DeleteChannel(ctx context.Context, id string) error {
+	id, err := normalizeChannelID(id)
 	if err != nil {
 		return err
 	}
-	exists, err := s.ChannelExists(ctx, channelID)
+	if id == DefaultChannelID {
+		return ErrProtected
+	}
+	transaction, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin channel delete: %w", err)
+	}
+	defer transaction.Rollback()
+	var exists bool
+	if err := transaction.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM channels WHERE id = ?)", id).Scan(&exists); err != nil {
+		return fmt.Errorf("check channel delete: %w", err)
 	}
 	if !exists {
 		return ErrNotFound
 	}
-	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
-	result, err := s.db.ExecContext(ctx, `
-        INSERT OR IGNORE INTO device_channels (device_id, channel_id, created_at)
-        SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM devices WHERE id = ?)
-    `, deviceID, channelID, createdAt, deviceID)
+	rows, err := transaction.QueryContext(ctx, "SELECT id FROM messages WHERE channel_id = ? AND kind = 'file'", id)
 	if err != nil {
-		return fmt.Errorf("join channel: %w", err)
+		return fmt.Errorf("read channel blobs: %w", err)
 	}
-	inserted, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("read channel join result: %w", err)
-	}
-	if inserted != 1 {
-		var live int
-		if err := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)", deviceID).Scan(&live); err != nil {
-			return fmt.Errorf("check channel member: %w", err)
+	var blobs []string
+	for rows.Next() {
+		var messageID string
+		if err := rows.Scan(&messageID); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan channel blob: %w", err)
 		}
-		if live == 0 {
-			return ErrUnauthorized
+		if !validID(messageID) {
+			rows.Close()
+			return fmt.Errorf("stored channel file id is invalid")
+		}
+		blobs = append(blobs, filepath.Join(s.blobsDir, messageID+".blob"))
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate channel blobs: %w", err)
+	}
+	rows.Close()
+	for _, statement := range []string{
+		"DELETE FROM retractions WHERE channel_id = ?",
+		"DELETE FROM messages WHERE channel_id = ?",
+		"DELETE FROM device_channels WHERE channel_id = ?",
+		"DELETE FROM channels WHERE id = ?",
+	} {
+		if _, err := transaction.ExecContext(ctx, statement, id); err != nil {
+			return fmt.Errorf("delete channel rows: %w", err)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit channel delete: %w", err)
+	}
+	for _, path := range blobs {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("delete channel %s: remove blob %s: %v", id, path, err)
 		}
 	}
 	return nil
-}
-
-func (s *Store) IsChannelMember(ctx context.Context, deviceID, channelID string) (bool, error) {
-	if !validID(deviceID) || !validChannelID(channelID) {
-		return false, nil
-	}
-	var member int
-	if err := s.db.QueryRowContext(ctx, `
-        SELECT EXISTS(SELECT 1 FROM device_channels WHERE device_id = ? AND channel_id = ?)
-    `, deviceID, channelID).Scan(&member); err != nil {
-		return false, fmt.Errorf("check channel membership: %w", err)
-	}
-	return member == 1, nil
 }
 
 // ChannelOfMessage reports which channel owns a message, including one whose
@@ -661,9 +654,11 @@ func (s *Store) ChannelOfMessage(ctx context.Context, id string) (string, error)
 
 func scanChannel(row rowScanner) (Channel, error) {
 	var channel Channel
-	if err := row.Scan(&channel.ID, &channel.Name, &channel.CreatedAt, &channel.Joined); err != nil {
+	if err := row.Scan(&channel.ID, &channel.Name, &channel.CreatedAt); err != nil {
 		return Channel{}, err
 	}
+	// Kept for older clients: every device can see every channel now.
+	channel.Joined = true
 	if !validChannelID(channel.ID) || channel.Name != channel.ID {
 		return Channel{}, fmt.Errorf("stored channel is invalid")
 	}
@@ -702,8 +697,8 @@ func (s *Store) CreateText(ctx context.Context, senderName, text string) (Messag
 }
 
 // CreateTextForDevice posts into one channel and fails with ErrUnauthorized
-// when the device is not a member, so membership is enforced at the write and
-// not only by the handler's pre-check.
+// when the device no longer exists or its persisted kind does not match, so the
+// write is checked at the database and not only by the handler's pre-check.
 func (s *Store) CreateTextForDevice(ctx context.Context, device Device, channelID, text string) (Message, error) {
 	if !validID(device.ID) || !validDeviceKind(device.Kind) {
 		return Message{}, ErrUnauthorized
@@ -744,7 +739,6 @@ func (s *Store) createText(ctx context.Context, requesterID, channelID, senderNa
 			INSERT INTO messages (id, kind, sender_name, sender_kind, sender_device_id, text_body, created_at, channel_id)
 			SELECT ?, 'text', ?, ?, ?, ?, ?, ?
             WHERE EXISTS (SELECT 1 FROM channels WHERE id = ?)
-              AND EXISTS (SELECT 1 FROM device_channels WHERE device_id = ? AND channel_id = ?)
               AND EXISTS (
                 SELECT 1 FROM devices
                 WHERE id = ? AND name = ?
@@ -752,7 +746,7 @@ func (s *Store) createText(ctx context.Context, requesterID, channelID, senderNa
             )
             RETURNING sequence
         `
-		arguments = []any{id, senderName, senderKind, requesterID, text, createdAt, channelID, channelID, requesterID, channelID, requesterID, senderName, senderKind, senderKind, inferDeviceKind(senderName)}
+		arguments = []any{id, senderName, senderKind, requesterID, text, createdAt, channelID, channelID, requesterID, senderName, senderKind, senderKind, inferDeviceKind(senderName)}
 	}
 	err = s.db.QueryRowContext(ctx, query, arguments...).Scan(&sequence)
 	if errors.Is(err, sql.ErrNoRows) && requesterID != "" {
@@ -853,7 +847,6 @@ func (s *Store) createFile(ctx context.Context, requesterID, channelID, senderNa
 			INSERT INTO messages (id, kind, sender_name, sender_kind, sender_device_id, file_name, media_type, file_size, blob_name, created_at, channel_id)
 			SELECT ?, 'file', ?, ?, ?, ?, ?, ?, ?, ?, ?
             WHERE EXISTS (SELECT 1 FROM channels WHERE id = ?)
-              AND EXISTS (SELECT 1 FROM device_channels WHERE device_id = ? AND channel_id = ?)
               AND EXISTS (
                 SELECT 1 FROM devices
                 WHERE id = ? AND name = ?
@@ -861,7 +854,7 @@ func (s *Store) createFile(ctx context.Context, requesterID, channelID, senderNa
             )
             RETURNING sequence
         `
-		arguments = []any{id, senderName, senderKind, requesterID, fileName, mediaType, written, blobName, createdAt, channelID, channelID, requesterID, channelID, requesterID, senderName, senderKind, senderKind, inferDeviceKind(senderName)}
+		arguments = []any{id, senderName, senderKind, requesterID, fileName, mediaType, written, blobName, createdAt, channelID, channelID, requesterID, senderName, senderKind, senderKind, inferDeviceKind(senderName)}
 	}
 	err = s.db.QueryRowContext(ctx, query, arguments...).Scan(&sequence)
 	if errors.Is(err, sql.ErrNoRows) && requesterID != "" {
@@ -964,17 +957,17 @@ func (s *Store) RetractMessage(ctx context.Context, requesterID, channelID, id s
 		return err
 	}
 	defer tx.Rollback()
-	var member bool
-	if err := tx.QueryRowContext(ctx, `
-        SELECT EXISTS(SELECT 1 FROM device_channels WHERE device_id = ? AND channel_id = ?)
-    `, requesterID, channelID).Scan(&member); err != nil {
+	// Any live device can recall a message in any channel. Membership is not a
+	// permission, but a revoked device must not be able to keep acting.
+	var live bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)", requesterID).Scan(&live); err != nil {
 		return err
 	}
-	if !member {
+	if !live {
 		return ErrUnauthorized
 	}
 	// Persist intent before unlink, including for legacy messages. Any live
-	// device in the channel can finish or retry the same operation.
+	// device can finish or retry the same operation.
 	var exists bool
 	if err := tx.QueryRowContext(ctx, `
         SELECT EXISTS(SELECT 1 FROM messages WHERE id = ? AND channel_id = ?)

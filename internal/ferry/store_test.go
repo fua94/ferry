@@ -374,7 +374,7 @@ func TestDeviceTokenPersistsAsHashAndRevokesImmediately(t *testing.T) {
 	if err != nil || authenticated.ID != device.ID {
 		t.Fatalf("authenticated = %#v, error = %v", authenticated, err)
 	}
-	devices, err := reopened.ListDevices(ctx, DefaultChannelID)
+	devices, err := reopened.ListDevices(ctx)
 	if err != nil || len(devices) != 1 || devices[0].ID != device.ID {
 		t.Fatalf("devices = %#v, error = %v", devices, err)
 	}
@@ -386,16 +386,16 @@ func TestDeviceTokenPersistsAsHashAndRevokesImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reopened.DeleteDevice(ctx, second.ID, DefaultChannelID, device.ID); err != nil {
+	if err := reopened.DeleteDevice(ctx, second.ID, device.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reopened.AuthenticateDevice(ctx, hash); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("authentication after revoke error = %v", err)
 	}
-	if err := reopened.DeleteDevice(ctx, second.ID, DefaultChannelID, device.ID); !errors.Is(err, ErrNotFound) {
+	if err := reopened.DeleteDevice(ctx, second.ID, device.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second delete error = %v", err)
 	}
-	if err := reopened.DeleteDevice(ctx, second.ID, DefaultChannelID, second.ID); !errors.Is(err, ErrInvalid) {
+	if err := reopened.DeleteDevice(ctx, second.ID, second.ID); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("self delete error = %v", err)
 	}
 }
@@ -444,7 +444,7 @@ func TestDeviceCreationRequiresIssuerAtInsertTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteDevice(ctx, owner.ID, DefaultChannelID, issuer.ID); err != nil {
+	if err := store.DeleteDevice(ctx, owner.ID, issuer.ID); err != nil {
 		t.Fatal(err)
 	}
 	_, claimedHash, err := newDeviceToken()
@@ -477,13 +477,13 @@ func TestRevokedRequesterCannotDeleteAnotherDevice(t *testing.T) {
 	first := create("First")
 	second := create("Second")
 	third := create("Third")
-	if err := store.DeleteDevice(ctx, second.ID, DefaultChannelID, first.ID); err != nil {
+	if err := store.DeleteDevice(ctx, second.ID, first.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteDevice(ctx, first.ID, DefaultChannelID, second.ID); !errors.Is(err, ErrUnauthorized) {
+	if err := store.DeleteDevice(ctx, first.ID, second.ID); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("revoked requester delete error = %v", err)
 	}
-	devices, err := store.ListDevices(ctx, DefaultChannelID)
+	devices, err := store.ListDevices(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,7 +568,7 @@ func TestRevokedDeviceCannotCreateMessages(t *testing.T) {
 	}
 	revoked := create("Revoked")
 	owner := create("Owner")
-	if err := store.DeleteDevice(ctx, owner.ID, DefaultChannelID, revoked.ID); err != nil {
+	if err := store.DeleteDevice(ctx, owner.ID, revoked.ID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -623,7 +623,7 @@ func TestRevokingDeviceDuringFileUploadPreventsMessageAndBlob(t *testing.T) {
 		result <- err
 	}()
 	<-started
-	if err := store.DeleteDevice(ctx, owner.ID, DefaultChannelID, uploader.ID); err != nil {
+	if err := store.DeleteDevice(ctx, owner.ID, uploader.ID); err != nil {
 		t.Fatal(err)
 	}
 	close(release)
@@ -671,7 +671,7 @@ func TestConcurrentCrossRevokeCannotRemoveEveryDevice(t *testing.T) {
 		group.Add(1)
 		go func(requester, target string) {
 			defer group.Done()
-			errorsSeen <- store.DeleteDevice(ctx, requester, DefaultChannelID, target)
+			errorsSeen <- store.DeleteDevice(ctx, requester, target)
 		}(pair[0], pair[1])
 	}
 	group.Wait()
@@ -684,7 +684,7 @@ func TestConcurrentCrossRevokeCannotRemoveEveryDevice(t *testing.T) {
 			t.Fatalf("cross revoke error = %v", err)
 		}
 	}
-	devices, err := store.ListDevices(ctx, DefaultChannelID)
+	devices, err := store.ListDevices(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

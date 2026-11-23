@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -69,7 +70,7 @@ func TestLegacyDatabaseGainsDefaultChannelAndMemberships(t *testing.T) {
 	}
 	t.Cleanup(func() { store.Close() })
 
-	channels, err := store.ListChannels(t.Context(), "0123456789abcdef0123456789abcdef")
+	channels, err := store.ListChannels(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +97,7 @@ func TestLegacyDatabaseGainsDefaultChannelAndMemberships(t *testing.T) {
 	}
 
 	// Reopening a migrated database must be idempotent and must not duplicate
-	// the default membership.
+	// the default membership row that the legacy backfill created.
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +115,7 @@ func TestLegacyDatabaseGainsDefaultChannelAndMemberships(t *testing.T) {
 	}
 }
 
-func TestChannelsIsolateMessagesAndMembership(t *testing.T) {
+func TestChannelsIsolateMessagesWithoutMembership(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	create := func(name string) Device {
@@ -136,18 +137,7 @@ func TestChannelsIsolateMessagesAndMembership(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, channelID := range []string{"alpha", "beta"} {
-		if err := store.JoinChannel(ctx, alice.ID, channelID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := store.JoinChannel(ctx, bob.ID, "alpha"); err != nil {
-		t.Fatal(err)
-	}
-	if member, err := store.IsChannelMember(ctx, bob.ID, "beta"); err != nil || member {
-		t.Fatalf("bob beta membership = %v, %v", member, err)
-	}
-
+	// No join calls: every device can already write every channel.
 	alphaText, err := store.CreateTextForDevice(ctx, alice, "alpha", "in alpha")
 	if err != nil {
 		t.Fatal(err)
@@ -159,21 +149,23 @@ func TestChannelsIsolateMessagesAndMembership(t *testing.T) {
 	if _, err := store.CreateTextForDevice(ctx, bob, "alpha", "bob in alpha"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.CreateTextForDevice(ctx, bob, "beta", "bob in beta"); err != nil {
+		t.Fatal(err)
+	}
+	betaFile, err := store.CreateFileForDevice(ctx, bob, "beta", "beta.txt", "text/plain", strings.NewReader("beta bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	alphaMessages, _, err := store.ListMessages(ctx, "alpha", 0, 100)
 	if err != nil || len(alphaMessages) != 3 {
 		t.Fatalf("alpha messages = %#v, error = %v", alphaMessages, err)
 	}
 	betaMessages, _, err := store.ListMessages(ctx, "beta", 0, 100)
-	if err != nil || len(betaMessages) != 0 {
+	if err != nil || len(betaMessages) != 2 {
 		t.Fatalf("beta messages = %#v, error = %v", betaMessages, err)
 	}
-	if _, err := store.CreateTextForDevice(ctx, bob, "beta", "must not land"); !errors.Is(err, ErrUnauthorized) {
-		t.Fatalf("non-member text error = %v, want ErrUnauthorized", err)
-	}
-	if _, err := store.CreateFileForDevice(ctx, bob, "beta", "x.txt", "text/plain", strings.NewReader("x")); !errors.Is(err, ErrUnauthorized) {
-		t.Fatalf("non-member file error = %v, want ErrUnauthorized", err)
-	}
+	// Content stays isolated by channel even though access does not.
 	if _, _, err := store.OpenFile(ctx, "beta", alphaFile.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-channel OpenFile error = %v, want ErrNotFound", err)
 	}
@@ -181,17 +173,22 @@ func TestChannelsIsolateMessagesAndMembership(t *testing.T) {
 		t.Fatalf("cross-channel recall error = %v, want ErrNotFound", err)
 	}
 
-	betaDevices, err := store.ListDevices(ctx, "beta")
-	if err != nil || len(betaDevices) != 1 || betaDevices[0].ID != alice.ID {
-		t.Fatalf("beta devices = %#v, error = %v", betaDevices, err)
+	// The device list is server-wide, not per channel.
+	devices, err := store.ListDevices(ctx)
+	if err != nil || len(devices) != 2 {
+		t.Fatalf("devices = %#v, error = %v", devices, err)
 	}
-	defaultDevices, err := store.ListDevices(ctx, DefaultChannelID)
-	if err != nil || len(defaultDevices) != 2 {
-		t.Fatalf("default devices = %#v, error = %v", defaultDevices, err)
+	seen := map[string]bool{}
+	for _, device := range devices {
+		seen[device.ID] = true
+	}
+	if !seen[alice.ID] || !seen[bob.ID] {
+		t.Fatalf("devices = %#v", devices)
 	}
 
+	// Any live device can recall any message in any channel.
 	if err := store.RetractMessage(ctx, bob.ID, "alpha", alphaText.ID); err != nil {
-		t.Fatalf("member recall in alpha: %v", err)
+		t.Fatalf("shared recall in alpha: %v", err)
 	}
 	alphaRetractions, _, err := store.ListRetractions(ctx, "alpha", 0, 10)
 	if err != nil || len(alphaRetractions) != 1 || alphaRetractions[0] != alphaText.ID {
@@ -204,6 +201,9 @@ func TestChannelsIsolateMessagesAndMembership(t *testing.T) {
 	// The file message recalled through the wrong channel is still live.
 	if _, _, err := store.OpenFile(ctx, "alpha", alphaFile.ID); err != nil {
 		t.Fatalf("alpha file after cross-channel recall attempt: %v", err)
+	}
+	if _, _, err := store.OpenFile(ctx, "beta", betaFile.ID); err != nil {
+		t.Fatalf("beta file after cross-channel recall attempt: %v", err)
 	}
 }
 
@@ -219,7 +219,7 @@ func TestChannelCreationValidationAndConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.ID != "trabajo-2" || created.Name != "trabajo-2" || created.CreatedAt == "" {
+	if created.ID != "trabajo-2" || created.Name != "trabajo-2" || created.CreatedAt == "" || !created.Joined {
 		t.Fatalf("created channel = %#v", created)
 	}
 	if _, err := store.CreateChannel(ctx, "trabajo-2"); !errors.Is(err, ErrConflict) {
@@ -255,7 +255,7 @@ func TestJoinMissingChannelLeavesNoDevice(t *testing.T) {
 	}
 }
 
-func TestHTTPChannelsCreateListJoinAndIsolation(t *testing.T) {
+func TestHTTPChannelsCreateListAndSharedVisibility(t *testing.T) {
 	handler, store := newRawTestApp(t, false)
 	join := func(name, channel string) claimResponse {
 		t.Helper()
@@ -278,7 +278,7 @@ func TestHTTPChannelsCreateListJoinAndIsolation(t *testing.T) {
 		Channels []Channel `json:"channels"`
 	}
 	decodeResponse(t, list, &channels)
-	if len(channels.Channels) != 1 || channels.Channels[0].ID != DefaultChannelID {
+	if len(channels.Channels) != 1 || channels.Channels[0].ID != DefaultChannelID || !channels.Channels[0].Joined {
 		t.Fatalf("initial channels = %#v", channels.Channels)
 	}
 	assertJSONKeys(t, list.Body.Bytes(), "channels", []string{"channels"})
@@ -288,7 +288,7 @@ func TestHTTPChannelsCreateListJoinAndIsolation(t *testing.T) {
 	var channel Channel
 	decodeResponse(t, created, &channel)
 	assertJSONKeys(t, created.Body.Bytes(), "created channel", []string{"created_at", "id", "joined", "name"})
-	if channel.ID != "trabajo" || channel.Name != "trabajo" {
+	if channel.ID != "trabajo" || channel.Name != "trabajo" || !channel.Joined {
 		t.Fatalf("created channel = %#v", channel)
 	}
 
@@ -303,10 +303,28 @@ func TestHTTPChannelsCreateListJoinAndIsolation(t *testing.T) {
 		}
 	}
 
-	peer := join("Peer", "trabajo")
+	// A device joined only to default already sees every channel and can read
+	// and write trabajo without calling join.
+	peer := join("Peer", "")
+	peerList := authenticatedRequest(t, handler, http.MethodGet, "/api/v1/channels", "", peer.Token)
+	assertStatus(t, peerList, http.StatusOK)
+	decodeResponse(t, peerList, &channels)
+	if len(channels.Channels) != 2 {
+		t.Fatalf("peer channels = %#v", channels.Channels)
+	}
+	for _, listed := range channels.Channels {
+		if !listed.Joined {
+			t.Fatalf("peer channel %#v is not visible", listed)
+		}
+	}
+
 	sent := authenticatedRequest(t, handler, http.MethodPost, "/api/v1/messages/text?channel=trabajo", `{"text":"hola trabajo"}`, peer.Token)
 	if sent.Code != http.StatusCreated {
 		t.Fatalf("send to trabajo status = %d, body = %s", sent.Code, sent.Body.String())
+	}
+	sentDefault := authenticatedRequest(t, handler, http.MethodPost, "/api/v1/messages/text", `{"text":"hola default"}`, peer.Token)
+	if sentDefault.Code != http.StatusCreated {
+		t.Fatalf("send to default status = %d, body = %s", sentDefault.Code, sentDefault.Body.String())
 	}
 
 	read := func(token, path string) []Message {
@@ -324,34 +342,30 @@ func TestHTTPChannelsCreateListJoinAndIsolation(t *testing.T) {
 	if messages := read(owner.Token, "/api/v1/messages?channel=trabajo"); len(messages) != 1 || messages[0].Text == nil || *messages[0].Text != "hola trabajo" {
 		t.Fatalf("trabajo messages = %#v", messages)
 	}
-	if messages := read(owner.Token, "/api/v1/messages"); len(messages) != 0 {
+	if messages := read(owner.Token, "/api/v1/messages"); len(messages) != 1 || messages[0].Text == nil || *messages[0].Text != "hola default" {
 		t.Fatalf("default messages = %#v", messages)
 	}
 
-	// The peer joined only "trabajo", so default membership stays out.
+	// Device lists are server-wide; the channel parameter only has to exist.
 	devices := authenticatedRequest(t, handler, http.MethodGet, "/api/v1/devices", "", owner.Token)
 	var devicePage struct {
 		Devices []Device `json:"devices"`
 	}
 	decodeResponse(t, devices, &devicePage)
-	for _, device := range devicePage.Devices {
-		if device.ID == peer.Device.ID {
-			t.Fatalf("peer joined only trabajo but appears in default devices: %#v", devicePage.Devices)
-		}
-	}
-	// Creating a channel joins its creator; the peer joined the same channel at
-	// join time, while nobody was added to default.
-	trabajoDevices := authenticatedRequest(t, handler, http.MethodGet, "/api/v1/devices?channel=trabajo", "", owner.Token)
-	assertStatus(t, trabajoDevices, http.StatusOK)
-	decodeResponse(t, trabajoDevices, &devicePage)
 	if len(devicePage.Devices) != 2 {
-		t.Fatalf("trabajo devices = %#v", devicePage.Devices)
+		t.Fatalf("devices = %#v", devicePage.Devices)
 	}
 	seen := map[string]bool{}
 	for _, device := range devicePage.Devices {
 		seen[device.ID] = true
 	}
 	if !seen[owner.Device.ID] || !seen[peer.Device.ID] {
+		t.Fatalf("devices = %#v", devicePage.Devices)
+	}
+	trabajoDevices := authenticatedRequest(t, handler, http.MethodGet, "/api/v1/devices?channel=trabajo", "", owner.Token)
+	assertStatus(t, trabajoDevices, http.StatusOK)
+	decodeResponse(t, trabajoDevices, &devicePage)
+	if len(devicePage.Devices) != 2 {
 		t.Fatalf("trabajo devices = %#v", devicePage.Devices)
 	}
 
@@ -390,16 +404,15 @@ func TestHTTPChannelsCreateListJoinAndIsolation(t *testing.T) {
 	}
 }
 
-func TestHTTPDeviceJoinsExistingChannel(t *testing.T) {
-	handler, _ := newRawTestApp(t, false)
+func TestHTTPChannelJoinIsIdempotentNoOp(t *testing.T) {
+	handler, store := newRawTestApp(t, false)
 	owner := decodeClaim(t, requestJSON(t, handler, http.MethodPost, "/api/v1/access/join", `{"device_name":"Owner","password":""}`))
 	if response := authenticatedRequest(t, handler, http.MethodPost, "/api/v1/channels", `{"name":"trabajo"}`, owner.Token); response.Code != http.StatusCreated {
 		t.Fatalf("create channel status = %d, body = %s", response.Code, response.Body.String())
 	}
 	peer := decodeClaim(t, requestJSON(t, handler, http.MethodPost, "/api/v1/access/join", `{"device_name":"Peer","password":""}`))
 
-	// The picker shows every channel on the server, with joined=false for the
-	// ones this device still has to join.
+	// The picker shows every channel on the server, all visible to this device.
 	list := authenticatedRequest(t, handler, http.MethodGet, "/api/v1/channels", "", peer.Token)
 	assertStatus(t, list, http.StatusOK)
 	var listed struct {
@@ -410,27 +423,42 @@ func TestHTTPDeviceJoinsExistingChannel(t *testing.T) {
 		t.Fatalf("peer channels = %#v", listed.Channels)
 	}
 	for _, channel := range listed.Channels {
-		if channel.Joined != (channel.ID == DefaultChannelID) {
-			t.Fatalf("peer channel %#v has the wrong joined flag", channel)
+		if !channel.Joined {
+			t.Fatalf("peer channel %#v is not visible", channel)
 		}
 	}
 
-	// Before joining, the channel does not exist as far as this device knows.
-	if response := authenticatedRequest(t, handler, http.MethodGet, "/api/v1/messages?channel=trabajo", "", peer.Token); response.Code != http.StatusNotFound {
+	// Without any join call the peer can already read and write the channel.
+	if response := authenticatedRequest(t, handler, http.MethodGet, "/api/v1/messages?channel=trabajo", "", peer.Token); response.Code != http.StatusOK {
 		t.Fatalf("peer before join status = %d, body = %s", response.Code, response.Body.String())
 	}
-	if response := authenticatedRequest(t, handler, http.MethodPost, "/api/v1/channels/join", `{"channel":"trabajo"}`, peer.Token); response.Code != http.StatusNoContent {
-		t.Fatalf("join status = %d, body = %s", response.Code, response.Body.String())
-	}
-	if response := authenticatedRequest(t, handler, http.MethodGet, "/api/v1/messages?channel=trabajo", "", peer.Token); response.Code != http.StatusOK {
-		t.Fatalf("peer after join status = %d, body = %s", response.Code, response.Body.String())
-	}
 	if response := authenticatedRequest(t, handler, http.MethodPost, "/api/v1/messages/text?channel=trabajo", `{"text":"desde el peer"}`, peer.Token); response.Code != http.StatusCreated {
-		t.Fatalf("peer send after join status = %d, body = %s", response.Code, response.Body.String())
+		t.Fatalf("peer send before join status = %d, body = %s", response.Code, response.Body.String())
 	}
-	// Joining twice is harmless: the same device, the same channel.
-	if response := authenticatedRequest(t, handler, http.MethodPost, "/api/v1/channels/join", `{"channel":"trabajo"}`, peer.Token); response.Code != http.StatusNoContent {
-		t.Fatalf("second join status = %d, body = %s", response.Code, response.Body.String())
+
+	memberships := func() int {
+		t.Helper()
+		var count int
+		if err := store.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM device_channels WHERE device_id = ?", peer.Device.ID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	before := memberships()
+	for range 2 {
+		if response := authenticatedRequest(t, handler, http.MethodPost, "/api/v1/channels/join", `{"channel":"trabajo"}`, peer.Token); response.Code != http.StatusNoContent {
+			t.Fatalf("join status = %d, body = %s", response.Code, response.Body.String())
+		}
+	}
+	if after := memberships(); after != before {
+		t.Fatalf("join wrote membership rows: %d -> %d", before, after)
+	}
+	var trabajoRows int
+	if err := store.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM device_channels WHERE device_id = ? AND channel_id = ?", peer.Device.ID, "trabajo").Scan(&trabajoRows); err != nil {
+		t.Fatal(err)
+	}
+	if trabajoRows != 0 {
+		t.Fatalf("join created %d membership rows for trabajo", trabajoRows)
 	}
 
 	cases := []struct {
@@ -451,6 +479,158 @@ func TestHTTPDeviceJoinsExistingChannel(t *testing.T) {
 	}
 	if response := requestJSON(t, handler, http.MethodPost, "/api/v1/channels/join", `{"channel":"trabajo"}`); response.Code != http.StatusUnauthorized {
 		t.Fatalf("anonymous join status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestHTTPDeleteChannelCascadesAndProtectsDefault(t *testing.T) {
+	handler, store := newRawTestApp(t, false)
+	join := func(name, channel string) claimResponse {
+		t.Helper()
+		body := `{"device_name":"` + name + `","password":""`
+		if channel != "" {
+			body += `,"channel":"` + channel + `"`
+		}
+		body += `}`
+		response := requestJSON(t, handler, http.MethodPost, "/api/v1/access/join", body)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("join %s in %q status = %d, body = %s", name, channel, response.Code, response.Body.String())
+		}
+		return decodeClaim(t, response)
+	}
+	owner := join("Owner", "")
+	for _, name := range []string{"alpha", "beta"} {
+		if response := authenticatedRequest(t, handler, http.MethodPost, "/api/v1/channels", `{"name":"`+name+`"}`, owner.Token); response.Code != http.StatusCreated {
+			t.Fatalf("create %s status = %d, body = %s", name, response.Code, response.Body.String())
+		}
+	}
+	// Give alpha a legacy membership row so the cascade has one to remove.
+	join("Alpha Peer", "alpha")
+
+	defaultMessage, err := store.CreateTextForDevice(t.Context(), owner.Device, DefaultChannelID, "keep default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateTextForDevice(t.Context(), owner.Device, "alpha", "delete alpha text"); err != nil {
+		t.Fatal(err)
+	}
+	alphaFile, err := store.CreateFileForDevice(t.Context(), owner.Device, "alpha", "alpha.txt", "text/plain", strings.NewReader("alpha bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alphaRecalled, err := store.CreateTextForDevice(t.Context(), owner.Device, "alpha", "recalled before delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RetractMessage(t.Context(), owner.Device.ID, "alpha", alphaRecalled.ID); err != nil {
+		t.Fatal(err)
+	}
+	betaText, err := store.CreateTextForDevice(t.Context(), owner.Device, "beta", "keep beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	betaFile, err := store.CreateFileForDevice(t.Context(), owner.Device, "beta", "beta.txt", "text/plain", strings.NewReader("beta bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	linkResponse := authenticatedRequest(t, handler, http.MethodPost, "/api/v1/files/"+alphaFile.ID+"/link?channel=alpha", "", owner.Token)
+	assertStatus(t, linkResponse, http.StatusCreated)
+	var link struct {
+		URL string `json:"url"`
+	}
+	decodeResponse(t, linkResponse, &link)
+
+	count := func(query string, arguments ...any) int {
+		t.Helper()
+		var value int
+		if err := store.db.QueryRowContext(t.Context(), query, arguments...).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	if got := count("SELECT COUNT(*) FROM messages WHERE channel_id = ?", "alpha"); got != 2 {
+		t.Fatalf("alpha messages before delete = %d, want 2", got)
+	}
+	if got := count("SELECT COUNT(*) FROM retractions WHERE channel_id = ?", "alpha"); got != 1 {
+		t.Fatalf("alpha retractions before delete = %d, want 1", got)
+	}
+	if got := count("SELECT COUNT(*) FROM device_channels WHERE channel_id = ?", "alpha"); got == 0 {
+		t.Fatalf("alpha memberships before delete = 0, want the legacy row")
+	}
+
+	protected := authenticatedRequest(t, handler, http.MethodDelete, "/api/v1/channels/default", "", owner.Token)
+	if protected.Code != http.StatusConflict || errorCode(t, protected) != "channel_protected" {
+		t.Fatalf("default delete status = %d, body = %s", protected.Code, protected.Body.String())
+	}
+	if got := count("SELECT COUNT(*) FROM channels WHERE id = ?", DefaultChannelID); got != 1 {
+		t.Fatalf("default channel count after protected delete = %d", got)
+	}
+
+	deleted := authenticatedRequest(t, handler, http.MethodDelete, "/api/v1/channels/alpha", "", owner.Token)
+	assertStatus(t, deleted, http.StatusNoContent)
+	if deleted.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("delete response was cacheable")
+	}
+
+	list := authenticatedRequest(t, handler, http.MethodGet, "/api/v1/channels", "", owner.Token)
+	assertStatus(t, list, http.StatusOK)
+	var channels struct {
+		Channels []Channel `json:"channels"`
+	}
+	decodeResponse(t, list, &channels)
+	if len(channels.Channels) != 2 {
+		t.Fatalf("channels after delete = %#v", channels.Channels)
+	}
+	for _, channel := range channels.Channels {
+		if channel.ID == "alpha" {
+			t.Fatalf("deleted channel still listed: %#v", channel)
+		}
+	}
+	if response := authenticatedRequest(t, handler, http.MethodGet, "/api/v1/messages?channel=alpha", "", owner.Token); response.Code != http.StatusNotFound || errorCode(t, response) != "not_found" {
+		t.Fatalf("read deleted channel status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	for _, query := range []string{
+		"SELECT COUNT(*) FROM messages WHERE channel_id = ?",
+		"SELECT COUNT(*) FROM retractions WHERE channel_id = ?",
+		"SELECT COUNT(*) FROM device_channels WHERE channel_id = ?",
+		"SELECT COUNT(*) FROM channels WHERE id = ?",
+	} {
+		if got := count(query, "alpha"); got != 0 {
+			t.Fatalf("%q after delete = %d, want 0", query, got)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(store.blobsDir, alphaFile.ID+".blob")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("alpha blob still exists: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(store.blobsDir, betaFile.ID+".blob")); err != nil {
+		t.Fatalf("beta blob was removed with alpha: %v", err)
+	}
+	if response := authenticatedRequest(t, handler, http.MethodGet, link.URL, "", ""); response.Code != http.StatusNotFound {
+		t.Fatalf("download link for deleted channel status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	// Other channels and the default timeline stay intact.
+	defaultMessages, _, err := store.ListMessages(t.Context(), DefaultChannelID, 0, 10)
+	if err != nil || len(defaultMessages) != 1 || defaultMessages[0].ID != defaultMessage.ID {
+		t.Fatalf("default messages after delete = %#v, error = %v", defaultMessages, err)
+	}
+	betaMessages, _, err := store.ListMessages(t.Context(), "beta", 0, 10)
+	if err != nil || len(betaMessages) != 2 || betaMessages[0].ID != betaText.ID {
+		t.Fatalf("beta messages after delete = %#v, error = %v", betaMessages, err)
+	}
+	if _, _, err := store.OpenFile(t.Context(), "beta", betaFile.ID); err != nil {
+		t.Fatalf("beta file after delete: %v", err)
+	}
+
+	if response := authenticatedRequest(t, handler, http.MethodDelete, "/api/v1/channels/alpha", "", owner.Token); response.Code != http.StatusNotFound || errorCode(t, response) != "not_found" {
+		t.Fatalf("second delete status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if response := authenticatedRequest(t, handler, http.MethodDelete, "/api/v1/channels/missing", "", owner.Token); response.Code != http.StatusNotFound || errorCode(t, response) != "not_found" {
+		t.Fatalf("missing delete status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if response := authenticatedRequest(t, handler, http.MethodDelete, "/api/v1/channels/Bad", "", owner.Token); response.Code != http.StatusBadRequest || errorCode(t, response) != "invalid_request" {
+		t.Fatalf("invalid delete status = %d, body = %s", response.Code, response.Body.String())
 	}
 }
 

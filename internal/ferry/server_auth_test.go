@@ -89,7 +89,7 @@ func TestStaleDeviceCannotChangeAccessSettings(t *testing.T) {
 	}
 	revoked := create("Revoked")
 	owner := create("Owner")
-	if err := store.DeleteDevice(t.Context(), owner.ID, DefaultChannelID, revoked.ID); err != nil {
+	if err := store.DeleteDevice(t.Context(), owner.ID, revoked.ID); err != nil {
 		t.Fatal(err)
 	}
 	request := httptest.NewRequest(http.MethodPut, "http://127.0.0.1/api/v1/settings/access", strings.NewReader(`{"password":"stolen"}`))
@@ -127,6 +127,8 @@ func TestAccessJSONIsStrictAndSettingsAreProtected(t *testing.T) {
 		{http.MethodPost, "/api/v1/files/0123456789abcdef0123456789abcdef/link"},
 		{http.MethodGet, "/api/v1/devices"}, {http.MethodDelete, "/api/v1/devices/0123456789abcdef0123456789abcdef"},
 		{http.MethodGet, "/api/v1/settings/access"}, {http.MethodPut, "/api/v1/settings/access"},
+		{http.MethodGet, "/api/v1/channels"}, {http.MethodPost, "/api/v1/channels"},
+		{http.MethodPost, "/api/v1/channels/join"}, {http.MethodDelete, "/api/v1/channels/trabajo"},
 		{http.MethodGet, "/api/v1/unknown"},
 	} {
 		response := requestJSON(t, handler, endpoint.method, endpoint.path, "")

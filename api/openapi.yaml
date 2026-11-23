@@ -49,11 +49,14 @@ paths:
               properties:
                 device_name: { type: string, minLength: 1, description: At most 64 UTF-8 bytes after trimming; control characters are rejected. }
                 password: { type: string, description: Empty when password access is disabled; otherwise the exact shared password, at most 256 UTF-8 bytes. }
-                channel: { $ref: "#/components/schemas/ChannelID" }
+                channel:
+                  allOf:
+                    - $ref: "#/components/schemas/ChannelID"
+                  description: Optional. When present it must exist (default when absent); because every device can use every channel, it does not restrict access.
               additionalProperties: false
       responses:
         "201":
-          description: Device connected and joined to the requested channel (default when the field is absent); token is returned once for origin-scoped client storage.
+          description: Device connected; the optional channel only had to exist, and the token is returned once for origin-scoped client storage.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/AccessClaim" }
@@ -65,10 +68,10 @@ paths:
         "415": { $ref: "#/components/responses/Error" }
   /api/v1/channels:
     get:
-      description: Every channel on the server, ordered by creation time then id, with a `joined` flag for the requesting device. Names are not secret on a trusted LAN; timeline contents still need membership.
+      description: Every channel on the server, ordered by creation time then id. Channels are visibility rather than permission, so every authenticated device sees every channel and can read and write it. `joined` is always true and is kept only for older clients.
       responses:
         "200":
-          description: Visible channels
+          description: All channels on the server
           content:
             application/json:
               schema:
@@ -81,7 +84,7 @@ paths:
                 additionalProperties: false
         "401": { $ref: "#/components/responses/Error" }
     post:
-      description: Creates a channel and joins the requesting device to it.
+      description: Creates a channel. Creation does not grant membership, because every authenticated device can already use every channel.
       requestBody:
         required: true
         content:
@@ -106,7 +109,7 @@ paths:
         "415": { $ref: "#/components/responses/Error" }
   /api/v1/channels/join:
     post:
-      description: Adds the requesting device to a channel that already exists, so it can read a second timeline without registering again. Unknown and non-existent channels both answer 404.
+      description: Kept only for API compatibility. Channels are visibility, not permission, so every device can already use every channel; joining writes nothing. An existing channel answers 204 and an unknown one answers 404.
       requestBody:
         required: true
         content:
@@ -119,13 +122,33 @@ paths:
               additionalProperties: false
       responses:
         "204":
-          description: Device joined the channel (idempotent)
+          description: The channel exists; the request is an idempotent no-op.
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "413": { $ref: "#/components/responses/Error" }
         "415": { $ref: "#/components/responses/Error" }
+  /api/v1/channels/{channel_id}:
+    delete:
+      description: Deletes a channel and, in one transaction, its messages, retractions, legacy device_channels rows and the channel row itself. File blobs are unlinked after the commit, so download links issued for them stop resolving. Any authenticated device may delete; the model has no owner or roles. The default channel is protected and a second delete of the same id is a 404.
+      parameters:
+        - name: channel_id
+          in: path
+          required: true
+          schema: { $ref: "#/components/schemas/ChannelID" }
+      responses:
+        "204":
+          description: Channel deleted.
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409":
+          description: The default channel cannot be deleted (`channel_protected`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
   /api/v1/session:
     get:
       responses:
@@ -172,6 +195,7 @@ paths:
         "415": { $ref: "#/components/responses/Error" }
   /api/v1/devices:
     get:
+      description: Every connected device. Devices are not scoped to a channel; when `channel` is present it only has to exist.
       parameters:
         - $ref: "#/components/parameters/ChannelQuery"
       responses:
@@ -190,6 +214,7 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
   /api/v1/devices/{device_id}:
     delete:
+      description: Revokes another connected device. Any authenticated device may do it; the optional channel only has to exist and does not scope the target.
       parameters:
         - name: device_id
           in: path
@@ -237,7 +262,7 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
   /api/v1/messages/{message_id}:
     delete:
-      description: Any authenticated connected device can recall any message, including legacy messages, without a time limit. Removes its server content and file bytes. Existing copies and in-flight downloads cannot be recalled. Retrying by any connected device is idempotent.
+      description: Any authenticated connected device can recall any message in any channel, including legacy messages, without a time limit. Removes its server content and file bytes. Existing copies and in-flight downloads cannot be recalled. Retrying by any connected device is idempotent.
       parameters:
         - name: message_id
           in: path
@@ -369,13 +394,13 @@ components:
       name: channel
       in: query
       required: false
-      description: Channel slug. Absent or empty selects the default channel; an unknown channel or one this device has not joined answers 404.
+      description: Channel slug. Absent or empty selects the default channel; an unknown channel answers 404. Every authenticated device can use every channel, so this never selects a membership.
       schema: { $ref: "#/components/schemas/ChannelID" }
   schemas:
     ChannelID:
       type: string
       pattern: "^[a-z0-9][a-z0-9-]{0,31}$"
-      description: Lowercase channel slug, 1 to 32 characters. The slug is also the visible channel name.
+      description: Lowercase channel slug, 1 to 32 characters. The slug is also the visible channel name, and the create body carries it in the `name` field.
     Channel:
       type: object
       required: [id, name, created_at, joined]
@@ -385,7 +410,8 @@ components:
         created_at: { type: string, format: date-time }
         joined:
           type: boolean
-          description: Whether the requesting device is a member. The list includes every channel on the server, like a Slack sidebar; reading a timeline still requires membership.
+          deprecated: true
+          description: Always true. Kept for older clients; it no longer means membership because every authenticated device sees and uses every channel.
       additionalProperties: false
     Device:
       type: object

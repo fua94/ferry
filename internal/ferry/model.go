@@ -30,6 +30,9 @@ var (
 	// ErrConflict reports a unique row that already exists, such as a channel
 	// slug. Handlers turn it into 409 rather than pretending the create worked.
 	ErrConflict = errors.New("already exists")
+	// ErrProtected reports a row that exists but must not be removed, such as
+	// the default channel. Handlers turn it into a stable 409.
+	ErrProtected = errors.New("protected")
 )
 
 type Kind string
@@ -82,9 +85,9 @@ type Device struct {
 const DefaultChannelID = "default"
 
 // Channel is one timeline. Its identifier is its visible name: a lowercase
-// slug, so clients never need a separate display name to address it. Joined
-// says whether the asking device is a member; the channel list shows every
-// channel on the server, like a Slack sidebar.
+// slug, so clients never need a separate display name to address it. Every
+// authenticated device can read and write every channel; Joined is kept only
+// for older clients and is always true.
 type Channel struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`

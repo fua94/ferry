@@ -48,7 +48,7 @@ func TestSharedRecallCursorAndFileAccess(t *testing.T) {
 		t.Fatalf("retry duplicated recall: %v %d %v", ids, next, err)
 	}
 	assertStatus(t, authenticatedRequest(t, handler, http.MethodGet, "/api/v1/messages?after_retraction=-1", "", owner.Token), http.StatusBadRequest)
-	if err := store.DeleteDevice(t.Context(), peer.Device.ID, DefaultChannelID, owner.Device.ID); err != nil {
+	if err := store.DeleteDevice(t.Context(), peer.Device.ID, owner.Device.ID); err != nil {
 		t.Fatal(err)
 	}
 	// Bypass middleware to reproduce a request authenticated before revocation.

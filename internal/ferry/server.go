@@ -64,6 +64,7 @@ func newHandler(store *Store, options HandlerOptions, now func() time.Time) http
 	api.HandleFunc("GET /api/v1/channels", s.listChannels)
 	api.HandleFunc("POST /api/v1/channels", s.createChannel)
 	api.HandleFunc("POST /api/v1/channels/join", s.joinChannel)
+	api.HandleFunc("DELETE /api/v1/channels/{channel_id}", s.deleteChannel)
 	api.HandleFunc("DELETE /api/v1/messages/{message_id}", s.retractMessage)
 	api.HandleFunc("POST /api/v1/messages/text", s.createText)
 	api.HandleFunc("POST /api/v1/messages/file", s.createFile)
@@ -274,21 +275,21 @@ func channelFromQuery(r *http.Request) (string, error) {
 	return normalizeChannelID(value)
 }
 
-// authorizedChannel resolves the request's channel and proves the current
-// device belongs to it. A malformed slug is a 400; an unknown channel and one
-// the device is not in are the same 404, so neither reveals the other.
+// authorizedChannel resolves the request's channel and proves it exists. A
+// malformed slug is a 400; an unknown channel is a 404. Channels are visibility
+// rather than permission, so the requesting device never scopes this check.
 func (s *server) authorizedChannel(w http.ResponseWriter, r *http.Request) (string, bool) {
 	channelID, err := channelFromQuery(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return "", false
 	}
-	member, err := s.store.IsChannelMember(r.Context(), currentDevice(r).ID, channelID)
+	exists, err := s.store.ChannelExists(r.Context(), channelID)
 	if err != nil {
 		s.internalError(w, err)
 		return "", false
 	}
-	if !member {
+	if !exists {
 		writeError(w, http.StatusNotFound, "not_found", "channel was not found")
 		return "", false
 	}
@@ -450,11 +451,12 @@ func (s *server) updateAccessSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listDevices(w http.ResponseWriter, r *http.Request) {
-	channelID, ok := s.authorizedChannel(w, r)
-	if !ok {
+	if _, ok := s.authorizedChannel(w, r); !ok {
 		return
 	}
-	devices, err := s.store.ListDevices(r.Context(), channelID)
+	// Every device is visible in every channel, so the channel only had to
+	// exist; it does not filter the list.
+	devices, err := s.store.ListDevices(r.Context())
 	if err != nil {
 		s.internalError(w, err)
 		return
@@ -464,11 +466,10 @@ func (s *server) listDevices(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) deleteDevice(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("device_id")
-	channelID, ok := s.authorizedChannel(w, r)
-	if !ok {
+	if _, ok := s.authorizedChannel(w, r); !ok {
 		return
 	}
-	err := s.store.DeleteDevice(r.Context(), currentDevice(r).ID, channelID, id)
+	err := s.store.DeleteDevice(r.Context(), currentDevice(r).ID, id)
 	if errors.Is(err, ErrUnauthorized) {
 		s.unauthorized(w)
 		return
@@ -542,17 +543,8 @@ func (s *server) retractMessage(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, err)
 		return
 	}
-	// A device outside the channel gets the same answer as one asking about a
-	// message that never existed.
-	member, err := s.store.IsChannelMember(r.Context(), currentDevice(r).ID, channelID)
-	if err != nil {
-		s.internalError(w, err)
-		return
-	}
-	if !member {
-		writeError(w, http.StatusNotFound, "not_found", "message was not found")
-		return
-	}
+	// Channels are visibility, not permission: any authenticated device can
+	// recall a message in any channel, so only the message's existence matters.
 	err = s.store.RetractMessage(r.Context(), currentDevice(r).ID, channelID, id)
 	if errors.Is(err, ErrUnauthorized) {
 		s.unauthorized(w)
@@ -571,11 +563,7 @@ func (s *server) retractMessage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listChannels(w http.ResponseWriter, r *http.Request) {
-	channels, err := s.store.ListChannels(r.Context(), currentDevice(r).ID)
-	if errors.Is(err, ErrUnauthorized) {
-		s.unauthorized(w)
-		return
-	}
+	channels, err := s.store.ListChannels(r.Context())
 	if err != nil {
 		s.internalError(w, err)
 		return
@@ -618,12 +606,7 @@ func (s *server) createChannel(w http.ResponseWriter, r *http.Request) {
 		s.domainError(w, err)
 		return
 	}
-	if err := s.store.JoinChannel(r.Context(), currentDevice(r).ID, channel.ID); err != nil {
-		s.internalError(w, err)
-		return
-	}
 	w.Header().Set("Cache-Control", "no-store")
-	channel.Joined = true
 	writeJSON(w, http.StatusCreated, channel)
 }
 
@@ -639,10 +622,11 @@ func decodeJoinChannelRequest(source io.Reader) (joinChannelRequest, error) {
 	return request, err
 }
 
-// joinChannel adds the current device to a channel that already exists, so a
-// device that already holds a token can read a second timeline without
-// registering again (and without a second token). An unknown channel is the
-// same 404 a non-member gets elsewhere, so it never confirms what exists.
+// joinChannel is kept only for API compatibility. Channels are visibility, not
+// permission, so every device can already read and write every channel; joining
+// writes nothing. It still answers 404 for an unknown channel and 204 for an
+// existing one, which keeps older clients working without resurrecting
+// membership.
 func (s *server) joinChannel(w http.ResponseWriter, r *http.Request) {
 	if !hasMediaType(r.Header.Get("Content-Type"), "application/json") {
 		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
@@ -664,17 +648,38 @@ func (s *server) joinChannel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	err = s.store.JoinChannel(r.Context(), currentDevice(r).ID, channelID)
+	exists, err := s.store.ChannelExists(r.Context(), channelID)
+	if err != nil {
+		s.internalError(w, err)
+		return
+	}
+	if !exists {
+		writeError(w, http.StatusNotFound, "not_found", "channel was not found")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteChannel removes a channel and every row and blob that belongs to it.
+// The default channel is protected with a stable 409; an unknown channel,
+// including a second delete of the same id, is 404.
+func (s *server) deleteChannel(w http.ResponseWriter, r *http.Request) {
+	err := s.store.DeleteChannel(r.Context(), r.PathValue("channel_id"))
+	if errors.Is(err, ErrProtected) {
+		writeError(w, http.StatusConflict, "channel_protected", "the default channel cannot be deleted")
+		return
+	}
 	if errors.Is(err, ErrNotFound) {
 		writeError(w, http.StatusNotFound, "not_found", "channel was not found")
 		return
 	}
-	if errors.Is(err, ErrUnauthorized) {
-		s.unauthorized(w)
+	if errors.Is(err, ErrInvalid) {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	if err != nil {
-		s.domainError(w, err)
+		s.internalError(w, err)
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
