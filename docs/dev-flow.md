@@ -19,6 +19,9 @@ manda `AGENTS.md`.
    renombrar o cambiar una ficha. Para ver el plan sin escribir: `npm run board:sync:dry`.
 5. **Nada de despliegues sin permiso.** Build, TestFlight, App Store, Docker o cualquier acción
    externa requieren autorización explícita; un build correcto no es permiso.
+6. **Done solo con el OK del usuario.** Una ficha pasa a `status: completado` (bucket Done) solo
+   cuando el usuario confirma que verificó el cambio y dio el OK. Mientras tanto se queda en
+   `en progreso`, aunque el código y los tests estén listos.
 
 ## Fichas de tareas
 
